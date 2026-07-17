@@ -17,6 +17,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <wrl/client.h>
 #include "headers/openvr.h"
 using Microsoft::WRL::ComPtr;
@@ -204,6 +206,7 @@ cbuffer StabParams : register(b0)
 	float4 fr;   // frustum tangents: l, r, t, b
 	float4 crop; // crop rect in mirror uv: u0, v0, du, dv
 	float4 misc; // x: re-encode srgb on output
+	float4 posc; // xyz: positional correction / reference depth (eye space)
 	float4x4 Rd; // actual<-smoothed rotation
 };
 Texture2D img : register(t0);
@@ -235,7 +238,7 @@ float4 PSMain(VSOut i) : SV_Target
 	float2 uvV = crop.xy + i.uv * crop.zw;
 	float tx = fr.x + uvV.x * (fr.y - fr.x);
 	float ty = fr.w - uvV.y * (fr.w - fr.z);
-	float3 d = mul((float3x3)Rd, float3(tx, ty, -1.0));
+	float3 d = mul((float3x3)Rd, float3(tx, ty, -1.0)) - posc.xyz;
 	float2 t2 = d.xy / max(-d.z, 1e-6);
 	float2 uv = float2((t2.x - fr.x) / (fr.y - fr.x), (fr.w - t2.y) / (fr.w - fr.z));
 	float4 c = img.Sample(smp, uv);
@@ -249,6 +252,7 @@ struct StabCBData {
 	float fr[4];
 	float crop[4];
 	float misc[4];
+	float posc[4];
 	float Rd[16];
 };
 
@@ -291,21 +295,40 @@ struct win_openvr {
 
 	// Stabilization settings
 	bool stabilize;
-	double stab_smoothing;
+	double stab_tau; // smoothing time constant, seconds
+	int stab_filter; // 0 = damped average, 1 = One Euro (adaptive)
 	bool stab_roll_lock;
+	bool stab_pos_comp;
+	double stab_pos_depth;
 	int stab_pose_delay;
 	bool stab_debug;
+	bool stab_telemetry;
+	FILE *stab_telemetry_file;
+	uint32_t stab_telemetry_lines;
+
+	quatd stab_q_ref; // raw pose of the displayed frame (telemetry)
 
 	// Per-eye projection frustum tangents from GetProjectionRaw
 	float proj_left, proj_right, proj_top, proj_bottom;
 
+	// Auto pose-delay state
+	int stab_auto_delay;
+	int stab_auto_want;
+	uint32_t stab_auto_pending;
+
 	// Filter state
 	bool stab_has_state;
 	quatd q_smooth;
-	quatd q_prev_raw;
-	double omega_lp;
+	quatd q_prev_raw; // One Euro speed estimate
+	double omega_lp;  // One Euro speed estimate, low-passed (rad/s)
 	double prev_pose_time;
 	uint32_t stab_resync_count;
+
+	// Positional compensation state (camera-frame correction, tangent units)
+	vec3d p_smooth;
+	vec3d stab_posc;      // current correction: d_cam / reference_depth
+	vec3d stab_posc_last; // reused on motion-smoothed frames
+	vec3d stab_p_raw;     // raw head position (telemetry)
 
 	// Reprojection pass resources (Milestone B)
 	ComPtr<ID3D11VertexShader> stabVS;
@@ -325,7 +348,6 @@ struct win_openvr {
 	uint32_t dbg_window_frame_index;
 	double dbg_max_dx, dbg_max_dy;
 	uint32_t dbg_clamped;
-	double dbg_fc;
 };
 
 // Compile the reprojection shaders and create the fixed GPU objects on the
@@ -395,7 +417,7 @@ static bool stab_create_gpu_resources(win_openvr *context)
 	return true;
 }
 
-static bool stab_corners_ok(win_openvr *context, const quatd &q_err_head);
+static bool stab_corners_ok(win_openvr *context, const quatd &q_err_head, const vec3d &posc_eye);
 
 // Helper to destroy OBS texture
 static void destroy_obs_texture(gs_texture_t **texture) {
@@ -444,6 +466,12 @@ static void win_openvr_init(void *data, bool forced = true)
 
 	context->texCrop.Reset();
 	context->tex.Reset();
+	// Abandon (do NOT Release) the previous mirror SRV before re-acquiring:
+	// the SteamVR runtime owns and caches that SRV, and a plain Release()
+	// mid-session corrupts its cache - crashed in d3d11.dll on the settings
+	// re-init path (2026-07-18). Detach only nulls our pointer, so a failed
+	// GetMirrorTextureD3D11 below still can't masquerade as success.
+	context->mirrorSrv.Detach();
 
 	IsVRSystemInitialized = true;
 
@@ -607,7 +635,8 @@ static void win_openvr_init(void *data, bool forced = true)
 					// Edge-pinned crop: corrections cannot stay inside the
 					// frame, so run unclamped and let the border show black.
 					context->stab_black_edges =
-						warp_ok && !stab_corners_ok(context, quatd{1.0, 0.0, 0.0, 0.0});
+						warp_ok && !stab_corners_ok(context, quatd{1.0, 0.0, 0.0, 0.0},
+									    vec3d{0.0, 0.0, 0.0});
 					context->stab_shader_ok = warp_ok;
 					if (!warp_ok)
 						warn("stab: reprojection pass unavailable, using crop-shift fallback");
@@ -663,6 +692,11 @@ static void win_openvr_deinit(void *data)
 	if (context->shared_device) context->shared_device.Reset();
 	if (context->shared_context) context->shared_context.Reset();
 
+	if (context->stab_telemetry_file) {
+		fclose(context->stab_telemetry_file);
+		context->stab_telemetry_file = nullptr;
+	}
+
 	vr::VR_Shutdown();
 
 	context->initialized = false;
@@ -701,8 +735,8 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 
 	bool stabilize = obs_data_get_bool(settings, "stabilize");
 
-	// Only crop geometry changes require re-acquiring the mirror texture;
-	// the stabilization filter parameters below apply live.
+	// Only crop geometry / buffer-size changes require re-acquiring the
+	// mirror texture; the stabilization filter parameters below apply live.
 	bool need_reinit = righteye != context->righteye ||
 			   scale_factor != context->scale_factor ||
 			   x_offset != context->x_offset ||
@@ -719,25 +753,51 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 	context->active_aspect_ratio = active_aspect_ratio;
 	context->stabilize = stabilize;
 
-	double stab_smoothing;
+	int stab_smooth_ms;
 	switch ((int)obs_data_get_int(settings, "stab_preset")) {
 	case 1:
-		stab_smoothing = 0.35; // Low
+		stab_smooth_ms = 200; // Low
 		break;
 	case 2:
-		stab_smoothing = 0.65; // Medium
+		stab_smooth_ms = 500; // Medium
 		break;
 	case 3:
-		stab_smoothing = 0.9; // High
+		stab_smooth_ms = 1000; // High
 		break;
 	default:
-		stab_smoothing = obs_data_get_double(settings, "stab_smoothing"); // Custom
+		stab_smooth_ms = (int)obs_data_get_int(settings, "stab_smooth_ms"); // Custom
 		break;
 	}
-	context->stab_smoothing = std::min(std::max(stab_smoothing, 0.0), 1.0);
+	context->stab_tau = std::min(std::max(stab_smooth_ms, 50), 2000) / 1000.0;
+	int stab_filter = (int)obs_data_get_int(settings, "stab_filter");
+	if (stab_filter != context->stab_filter)
+		context->stab_has_state = false; // start the speed estimate clean
+	context->stab_filter = stab_filter;
 	context->stab_roll_lock = obs_data_get_bool(settings, "stab_roll_lock");
-	context->stab_pose_delay = (int)obs_data_get_int(settings, "stab_pose_delay");
+
+	bool stab_pos_comp = obs_data_get_bool(settings, "stab_pos_comp");
+	if (stab_pos_comp != context->stab_pos_comp)
+		context->stab_has_state = false; // reseed the position state cleanly
+	context->stab_pos_comp = stab_pos_comp;
+	context->stab_pos_depth = std::min(std::max(obs_data_get_double(settings, "stab_pos_depth"), 0.3), 20.0);
+
+	int stab_pose_delay = std::min(std::max((int)obs_data_get_int(settings, "stab_pose_delay"), -1), 3);
+	if (stab_pose_delay != context->stab_pose_delay) {
+		context->stab_auto_pending = 0;
+		if (stab_pose_delay < 0)
+			context->stab_auto_delay = 1; // fresh auto estimate from the sane default
+	}
+	context->stab_pose_delay = stab_pose_delay;
 	context->stab_debug = obs_data_get_bool(settings, "stab_debug");
+	context->stab_telemetry = obs_data_get_bool(settings, "stab_telemetry");
+
+	// The warp loop closes the telemetry file when its checkbox goes off,
+	// but stops running entirely when stabilization is disabled - close it
+	// here too so the CSV tail is flushed as soon as recording stops.
+	if ((!context->stabilize || !context->stab_telemetry) && context->stab_telemetry_file) {
+		fclose(context->stab_telemetry_file);
+		context->stab_telemetry_file = nullptr;
+	}
 
 	if (context->initialized && need_reinit) {
 		context->initialized = false; // Force re-init
@@ -757,9 +817,13 @@ static void win_openvr_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "stabilize", false);
 	obs_data_set_default_int(settings, "stab_preset", 2);
 	obs_data_set_default_bool(settings, "stab_roll_lock", false);
-	obs_data_set_default_double(settings, "stab_smoothing", 0.65);
-	obs_data_set_default_int(settings, "stab_pose_delay", 1);
+	obs_data_set_default_bool(settings, "stab_pos_comp", false);
+	obs_data_set_default_double(settings, "stab_pos_depth", 1.5);
+	obs_data_set_default_int(settings, "stab_smooth_ms", 500);
+	obs_data_set_default_int(settings, "stab_filter", 0);
+	obs_data_set_default_int(settings, "stab_pose_delay", -1); // Auto
 	obs_data_set_default_bool(settings, "stab_debug", false);
+	obs_data_set_default_bool(settings, "stab_telemetry", false);
 }
 
 static uint32_t win_openvr_getwidth(void *data)
@@ -801,6 +865,7 @@ static void *win_openvr_create(obs_data_t *settings, obs_source_t *source)
 	context->width = context->height = 100;
 
 	context->active_aspect_ratio = 16.0 / 9.0;
+	context->stab_auto_delay = 1;
 
 	win_openvr_update(context, settings);
 	return context;
@@ -814,39 +879,95 @@ static void win_openvr_destroy(void *data)
 	bfree(context);
 }
 
-// Shared filter core: fetch the pose matching the current mirror frame and
-// advance the One Euro smoothed orientation. Returns false when no correction
-// should be applied this frame (seed frame, invalid pose, timing resync).
-static bool stab_update_filter(win_openvr *context, const vr::Compositor_FrameTiming *cur, quatd *q_a_out)
+// Which frames-ago timing entry does the mirror texture currently show?
+// Auto mode: the newest record that has actually been presented. The correct
+// offset is a property of the session (pipeline depth, refresh rate, motion
+// smoothing), so a fixed manual value goes stale between VR launches.
+// Call at most once per compositor frame (hysteresis counters advance).
+static int stab_resolve_pose_delay(win_openvr *context)
 {
-	const double kPi = 3.14159265358979323846;
+	if (context->stab_pose_delay >= 0)
+		return context->stab_pose_delay; // manual override
 
+	int want = 1; // fallback when nothing is marked presented
+	for (uint32_t k = 0; k <= 3; k++) {
+		vr::Compositor_FrameTiming t = {};
+		t.m_nSize = sizeof(vr::Compositor_FrameTiming);
+		if (!vr::VRCompositor()->GetFrameTiming(&t, k))
+			break;
+		if (t.m_nNumFramePresents > 0) {
+			want = (int)k;
+			break;
+		}
+	}
+
+	// Hysteresis: adopt a new offset only after ~30 consecutive frames of
+	// the SAME candidate, then reseed the filter so the pose-time
+	// discontinuity can't cause a lurch.
+	if (want == context->stab_auto_delay) {
+		context->stab_auto_pending = 0;
+	} else if (want != context->stab_auto_want) {
+		context->stab_auto_want = want;
+		context->stab_auto_pending = 1;
+	} else if (++context->stab_auto_pending >= 30) {
+		context->stab_auto_delay = want;
+		context->stab_auto_pending = 0;
+		context->stab_has_state = false;
+		if (context->stab_debug)
+			info("stab: auto pose delay -> %d", want);
+	}
+	return context->stab_auto_delay;
+}
+
+// Fetch the raw pose + reprojection flag matching the current mirror frame.
+static bool stab_fetch_pose(const vr::Compositor_FrameTiming *cur, int pose_delay, quatd *q_out, vec3d *p_out,
+			    double *t_out, bool *frozen_out)
+{
 	const vr::TrackedDevicePose_t *pose = &cur->m_HmdPose;
 	double pose_time = cur->m_flSystemTimeInSeconds;
+	uint32_t reproj_flags = cur->m_nReprojectionFlags;
 
 	// The newest timing entry is the frame the compositor just started;
 	// the mirror texture shows an older, already-composited frame.
 	vr::Compositor_FrameTiming past = {};
-	if (context->stab_pose_delay > 0) {
+	if (pose_delay > 0) {
 		past.m_nSize = sizeof(vr::Compositor_FrameTiming);
-		if (vr::VRCompositor()->GetFrameTiming(&past, (uint32_t)context->stab_pose_delay) &&
+		if (vr::VRCompositor()->GetFrameTiming(&past, (uint32_t)pose_delay) &&
 		    past.m_HmdPose.bPoseIsValid) {
 			pose = &past.m_HmdPose;
 			pose_time = past.m_flSystemTimeInSeconds;
+			reproj_flags = past.m_nReprojectionFlags;
 		}
 	}
 
-	if (!pose->bPoseIsValid || pose->eTrackingResult != vr::TrackingResult_Running_OK) {
-		context->stab_has_state = false;
+	if (!pose->bPoseIsValid || pose->eTrackingResult != vr::TrackingResult_Running_OK)
 		return false;
-	}
 
-	const quatd q_a = quat_normalize(quat_from_hmd34(pose->mDeviceToAbsoluteTracking));
+	*q_out = quat_normalize(quat_from_hmd34(pose->mDeviceToAbsoluteTracking));
+	const vr::HmdMatrix34_t &hm = pose->mDeviceToAbsoluteTracking;
+	*p_out = {hm.m[0][3], hm.m[1][3], hm.m[2][3]};
+	*t_out = pose_time;
+	*frozen_out = (reproj_flags & vr::VRCompositor_ReprojectionMotion) != 0;
+	return true;
+}
+
+// Filter core: advance the damped orientation average and the positional
+// compensation from the raw pose of the displayed frame. Returns false when
+// no correction should be applied this frame (seed frame, timing resync).
+static bool stab_filter_core(win_openvr *context, const vr::Compositor_FrameTiming *cur, const quatd &q_a,
+			     const vec3d &p_a, double pose_time)
+{
+	const double kPi = 3.14159265358979323846;
 
 	if (!context->stab_has_state) {
 		context->q_smooth = q_a;
 		context->q_prev_raw = q_a;
 		context->omega_lp = 0.0;
+		context->p_smooth = p_a;
+		context->stab_q_ref = q_a;
+		context->stab_p_raw = p_a;
+		context->stab_posc = {0.0, 0.0, 0.0};
+		context->stab_posc_last = {0.0, 0.0, 0.0};
 		context->prev_pose_time = pose_time;
 		context->stab_resync_count = 0;
 		context->dbg_window_start = pose_time;
@@ -862,6 +983,11 @@ static bool stab_update_filter(win_openvr *context, const vr::Compositor_FrameTi
 	if (dt <= 0.0 || dt > 0.25) {
 		context->q_smooth = q_a;
 		context->q_prev_raw = q_a;
+		context->omega_lp = 0.0;
+		context->p_smooth = p_a;
+		context->stab_posc = {0.0, 0.0, 0.0};
+		context->stab_q_ref = q_a;
+		context->stab_p_raw = p_a;
 		context->dbg_window_start = pose_time;
 		context->dbg_window_frame_index = cur->m_nFrameIndex;
 		if (++context->stab_resync_count == 200)
@@ -870,28 +996,97 @@ static bool stab_update_filter(win_openvr *context, const vr::Compositor_FrameTi
 	}
 	context->stab_resync_count = 0;
 
-	// One Euro filter: adaptive low-pass on orientation. fc_min sets the
-	// locked feel at rest, beta lets the camera catch up on deliberate turns.
-	double d_raw = fabs(quat_dot(context->q_prev_raw, q_a));
-	if (d_raw > 1.0)
-		d_raw = 1.0;
-	const double omega = 2.0 * acos(d_raw) / dt; // rad/s
-	context->q_prev_raw = q_a;
-	const double a_d = 1.0 - exp(-2.0 * kPi * 1.0 * dt); // 1 Hz derivative low-pass
-	context->omega_lp += a_d * (omega - context->omega_lp);
-
-	const double fc_min = 1.5 - 1.35 * context->stab_smoothing; // 1.5 Hz (light) .. 0.15 Hz (heavy)
-	const double beta = 0.7;
-	const double fc = fc_min + beta * context->omega_lp;
-	const double alpha = 1.0 - exp(-2.0 * kPi * fc * dt);
+	// Both filters share the Smoothing Time knob as the rest-state time
+	// constant, so they behave identically on a still head and differ only
+	// in motion - a clean A/B comparison.
+	// - Damped average: fixed cutoff; suppression is the same at rest and
+	//   during active motion, deliberate turns trail by up to tau * rate.
+	// - One Euro: cutoff rises with head speed (beta term); turns trail
+	//   far less, but fast motion also lets more tremor through.
+	double alpha;
+	if (context->stab_filter == 1) {
+		double d_raw = fabs(quat_dot(context->q_prev_raw, q_a));
+		if (d_raw > 1.0)
+			d_raw = 1.0;
+		const double omega = 2.0 * acos(d_raw) / dt; // rad/s
+		context->q_prev_raw = q_a;
+		const double a_d = 1.0 - exp(-2.0 * kPi * 1.0 * dt); // 1 Hz derivative low-pass
+		context->omega_lp += a_d * (omega - context->omega_lp);
+		const double fc_min = 1.0 / (2.0 * kPi * context->stab_tau);
+		const double beta = 0.7;
+		const double fc = fc_min + beta * context->omega_lp;
+		alpha = 1.0 - exp(-2.0 * kPi * fc * dt);
+	} else {
+		alpha = 1.0 - exp(-dt / context->stab_tau);
+	}
 	// With roll lock, the filter chases the LEVELED pose: steady state is an
 	// exactly level horizon, and toggling the lock glides at the filter rate.
 	const quatd q_target = context->stab_roll_lock ? quat_level_roll(q_a) : q_a;
 	context->q_smooth = quat_normalize(quat_slerp(context->q_smooth, q_target, alpha));
-	context->dbg_fc = fc;
 
-	*q_a_out = q_a;
+	// Hard 45-deg trail cap. Unlike the corner clamp (skipped in black-edges
+	// mode), this always holds: without it a fast sustained spin winds the
+	// error toward 180 deg, where slerp's hemisphere flip chases the target
+	// BACKWARD and the warp renders garbage. At the cap the view rides a
+	// fixed offset behind the turn and glides back when it ends.
+	const double cap = 45.0 * (kPi / 180.0);
+	double d_err = fabs(quat_dot(context->q_smooth, q_a));
+	if (d_err > 1.0)
+		d_err = 1.0;
+	const double err = 2.0 * acos(d_err);
+	if (err > cap)
+		context->q_smooth = quat_normalize(quat_slerp(q_a, context->q_smooth, cap / err));
+
+	// Positional jitter compensation: low-pass the head position and correct
+	// the (displayed-raw - smoothed) delta at an assumed scene depth. Capped
+	// at 2 cm so deliberate locomotion passes through untouched.
+	context->stab_p_raw = p_a;
+	context->stab_q_ref = q_a;
+	if (context->stab_pos_comp) {
+		const double a_p = 1.0 - exp(-2.0 * kPi * 0.75 * dt); // 0.75 Hz position low-pass
+		context->p_smooth = {context->p_smooth.x + a_p * (p_a.x - context->p_smooth.x),
+				     context->p_smooth.y + a_p * (p_a.y - context->p_smooth.y),
+				     context->p_smooth.z + a_p * (p_a.z - context->p_smooth.z)};
+		const vec3d dw = {p_a.x - context->p_smooth.x, p_a.y - context->p_smooth.y,
+				  p_a.z - context->p_smooth.z};
+		vec3d dc = quat_rotate(quat_conj(q_a), dw); // camera-frame delta, meters
+		const double len = sqrt(dc.x * dc.x + dc.y * dc.y + dc.z * dc.z);
+		const double cap = 0.02;
+		if (len > cap) {
+			const double s = cap / len;
+			dc = {dc.x * s, dc.y * s, dc.z * s};
+			const vec3d dwc = quat_rotate(q_a, dc);
+			context->p_smooth = {p_a.x - dwc.x, p_a.y - dwc.y, p_a.z - dwc.z};
+		}
+		vec3d pc = {dc.x / context->stab_pos_depth, dc.y / context->stab_pos_depth,
+			    dc.z / context->stab_pos_depth};
+		if (!std::isfinite(pc.x) || !std::isfinite(pc.y) || !std::isfinite(pc.z)) {
+			pc = {0.0, 0.0, 0.0};
+			context->p_smooth = p_a; // self-heal once poses are finite again
+		}
+		context->stab_posc = pc;
+	} else {
+		context->p_smooth = p_a;
+		context->stab_posc = {0.0, 0.0, 0.0};
+	}
+
 	return true;
+}
+
+// Fetch the raw pose and run the filter on it.
+static bool stab_update_filter(win_openvr *context, const vr::Compositor_FrameTiming *cur, int pose_delay,
+			       quatd *q_a_out)
+{
+	quatd q;
+	vec3d p;
+	double t;
+	bool frozen;
+	if (!stab_fetch_pose(cur, pose_delay, &q, &p, &t, &frozen)) {
+		context->stab_has_state = false;
+		return false;
+	}
+	*q_a_out = q;
+	return stab_filter_core(context, cur, q, p, t);
 }
 
 // Debug telemetry shared by both stabilization paths; logs every ~2 s.
@@ -908,9 +1103,9 @@ static void stab_debug_stats(win_openvr *context, const vr::Compositor_FrameTimi
 		context->dbg_clamped++;
 	const double elapsed = context->prev_pose_time - context->dbg_window_start;
 	if (elapsed >= 2.0) {
-		info("stab: compositor=%.1f fps, omega_lp=%.2f rad/s, fc=%.2f Hz, max corr=(%.2f, %.2f) %s, clamped %u frames",
-		     (double)(cur->m_nFrameIndex - context->dbg_window_frame_index) / elapsed, context->omega_lp,
-		     context->dbg_fc, context->dbg_max_dx, context->dbg_max_dy, unit, context->dbg_clamped);
+		info("stab: compositor=%.1f fps, tau=%.0f ms, max corr=(%.2f, %.2f) %s, clamped %u frames",
+		     (double)(cur->m_nFrameIndex - context->dbg_window_frame_index) / elapsed,
+		     context->stab_tau * 1000.0, context->dbg_max_dx, context->dbg_max_dy, unit, context->dbg_clamped);
 		context->dbg_window_start = context->prev_pose_time;
 		context->dbg_window_frame_index = cur->m_nFrameIndex;
 		context->dbg_max_dx = context->dbg_max_dy = 0.0;
@@ -932,7 +1127,7 @@ static void stab_compute_crop(win_openvr *context, const vr::Compositor_FrameTim
 		return; // no headroom (Zoom = 1) or no projection info
 
 	quatd q_a;
-	if (!stab_update_filter(context, cur, &q_a))
+	if (!stab_update_filter(context, cur, stab_resolve_pose_delay(context), &q_a))
 		return;
 
 	// Where the smoothed forward axis lands in the actual camera's image plane
@@ -983,9 +1178,10 @@ static void stab_compute_crop(win_openvr *context, const vr::Compositor_FrameTim
 	stab_debug_stats(context, cur, dx, dy, clamped, "px");
 }
 
-// True when every corner of the output crop, corrected by q_err_head, still
-// samples inside the mirror frustum (with a ~2 texel safety inset).
-static bool stab_corners_ok(win_openvr *context, const quatd &q_err_head)
+// True when every corner of the output crop, corrected by q_err_head and the
+// positional tangent offset, still samples inside the mirror frustum (with a
+// ~2 texel safety inset).
+static bool stab_corners_ok(win_openvr *context, const quatd &q_err_head, const vec3d &posc_eye)
 {
 	const quatd q_e = quat_mul(quat_mul(quat_conj(context->q_e2h), q_err_head), context->q_e2h);
 	const double W = (double)context->device_width, H = (double)context->device_height;
@@ -999,7 +1195,8 @@ static bool stab_corners_ok(win_openvr *context, const quatd &q_err_head)
 		for (int j = 0; j < 2; j++) {
 			const double tx = l + us[i] * (r - l);
 			const double ty = b - vs[j] * (b - t);
-			const vec3d d = quat_rotate(q_e, vec3d{tx, ty, -1.0});
+			const vec3d dr = quat_rotate(q_e, vec3d{tx, ty, -1.0});
+			const vec3d d = {dr.x - posc_eye.x, dr.y - posc_eye.y, dr.z - posc_eye.z};
 			if (!(d.z < -0.1))
 				return false;
 			const double px = d.x / -d.z, py = d.y / -d.z;
@@ -1008,6 +1205,50 @@ static bool stab_corners_ok(win_openvr *context, const quatd &q_err_head)
 		}
 	}
 	return true;
+}
+
+// Ground-truth recorder: one CSV row per compositor frame with the raw and
+// smoothed pose so filter behavior can be analyzed offline against real
+// motion data instead of guesses. Written to the OBS log folder.
+static void stab_telemetry_write(win_openvr *context, const vr::Compositor_FrameTiming *cur, int pose_delay,
+				 bool frozen, bool clamped, double corr_deg, const vec3d &posc_eye)
+{
+	if (!context->stab_telemetry) {
+		if (context->stab_telemetry_file) {
+			fclose(context->stab_telemetry_file);
+			context->stab_telemetry_file = nullptr;
+		}
+		return;
+	}
+	if (!context->stab_telemetry_file) {
+		const char *appdata = getenv("APPDATA");
+		if (!appdata)
+			return;
+		char path[512];
+		snprintf(path, sizeof(path), "%s\\obs-studio\\logs\\stab-telemetry.csv", appdata);
+		context->stab_telemetry_file = fopen(path, "w");
+		if (!context->stab_telemetry_file) {
+			warn("stab: could not open telemetry file %s", path);
+			context->stab_telemetry = false;
+			return;
+		}
+		info("stab: recording telemetry to %s", path);
+		fprintf(context->stab_telemetry_file,
+			"time,frame,delay,frozen,clamped,qa_w,qa_x,qa_y,qa_z,qs_w,qs_x,qs_y,qs_z,"
+			"pa_x,pa_y,pa_z,ps_x,ps_y,ps_z,corr_deg,posc_x,posc_y,posc_z\n");
+		context->stab_telemetry_lines = 0;
+	}
+	const quatd &qa = context->stab_q_ref;
+	const quatd &qs = context->q_smooth;
+	fprintf(context->stab_telemetry_file,
+		"%.6f,%u,%d,%d,%d,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,"
+		"%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.4f,%.6f,%.6f,%.6f\n",
+		context->prev_pose_time, cur->m_nFrameIndex, pose_delay, frozen ? 1 : 0, clamped ? 1 : 0, qa.w, qa.x,
+		qa.y, qa.z, qs.w, qs.x, qs.y, qs.z, context->stab_p_raw.x, context->stab_p_raw.y, context->stab_p_raw.z,
+		context->p_smooth.x, context->p_smooth.y, context->p_smooth.z, corr_deg, posc_eye.x, posc_eye.y,
+		posc_eye.z);
+	if (++context->stab_telemetry_lines % 90 == 0)
+		fflush(context->stab_telemetry_file);
 }
 
 // Milestone B: render the stabilized view by reprojecting the mirror texture
@@ -1022,47 +1263,54 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 		return false;
 
 	quatd q_err = {1.0, 0.0, 0.0, 0.0};
+	vec3d posc_eye = {0.0, 0.0, 0.0};
 	bool clamped = false;
 
-	// On motion-smoothed frames the compositor synthesized the image from an
-	// older frame + newer pose; the pose pairing is unreliable, so keep the
-	// previous correction instead of updating the filter with bad data.
-	// Read the flags from the same timing entry the filter takes its pose from.
-	uint32_t reproj_flags = cur->m_nReprojectionFlags;
-	if (context->stab_pose_delay > 0) {
-		vr::Compositor_FrameTiming past = {};
-		past.m_nSize = sizeof(vr::Compositor_FrameTiming);
-		if (vr::VRCompositor()->GetFrameTiming(&past, (uint32_t)context->stab_pose_delay))
-			reproj_flags = past.m_nReprojectionFlags;
-	}
-	const bool frozen = (reproj_flags & vr::VRCompositor_ReprojectionMotion) != 0;
-	if (frozen && context->stab_has_state) {
+	// On motion-smoothed frames the pose pairing is unreliable, so keep
+	// the previous correction instead of updating the filter with bad data.
+	const int pose_delay = stab_resolve_pose_delay(context);
+	quatd q_a;
+	vec3d p_a;
+	double t_a = 0.0;
+	bool frozen = false;
+	const bool have = stab_fetch_pose(cur, pose_delay, &q_a, &p_a, &t_a, &frozen);
+	if (!have)
+		context->stab_has_state = false;
+
+	if (have && frozen && context->stab_has_state) {
 		q_err = context->q_err_last;
-	} else {
-		quatd q_a;
-		if (stab_update_filter(context, cur, &q_a)) {
+		posc_eye = context->stab_posc_last;
+	} else if (have) {
+		if (stab_filter_core(context, cur, q_a, p_a, t_a)) {
 			q_err = quat_mul(quat_conj(q_a), context->q_smooth);
-			if (!context->stab_black_edges && !stab_corners_ok(context, q_err)) {
+			posc_eye = quat_rotate(quat_conj(context->q_e2h), context->stab_posc);
+			if (!context->stab_black_edges && !stab_corners_ok(context, q_err, posc_eye)) {
 				// Clamp the correction to the largest feasible fraction and
-				// absorb the excess into q_smooth (exact anti-windup).
+				// absorb the rotational excess into the output pose
+				// (anti-windup; the positional state is self-bounded).
 				const quatd q_target = context->q_smooth;
+				const vec3d posc_full = posc_eye;
 				double lo = 0.0, hi = 1.0;
 				for (int it = 0; it < 12; it++) {
 					const double mid = 0.5 * (lo + hi);
 					const quatd q_try =
 						quat_mul(quat_conj(q_a), quat_slerp(q_a, q_target, mid));
-					if (stab_corners_ok(context, q_try))
+					const vec3d p_try = {posc_full.x * mid, posc_full.y * mid,
+							     posc_full.z * mid};
+					if (stab_corners_ok(context, q_try, p_try))
 						lo = mid;
 					else
 						hi = mid;
 				}
 				context->q_smooth = quat_normalize(quat_slerp(q_a, q_target, lo));
 				q_err = quat_mul(quat_conj(q_a), context->q_smooth);
+				posc_eye = {posc_full.x * lo, posc_full.y * lo, posc_full.z * lo};
 				clamped = true;
 			}
 		}
 	}
 	context->q_err_last = q_err;
+	context->stab_posc_last = posc_eye;
 
 	// Conjugate the head-space delta into eye space (canted displays)
 	const quatd q_err_eye = quat_mul(quat_mul(quat_conj(context->q_e2h), q_err), context->q_e2h);
@@ -1077,6 +1325,9 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 	cb.crop[2] = (float)context->width / (float)context->device_width;
 	cb.crop[3] = (float)context->height / (float)context->device_height;
 	cb.misc[0] = context->stab_encode_srgb ? 1.0f : 0.0f;
+	cb.posc[0] = (float)posc_eye.x;
+	cb.posc[1] = (float)posc_eye.y;
+	cb.posc[2] = (float)posc_eye.z;
 	quat_to_mat4(q_err_eye, cb.Rd);
 
 	ID3D11DeviceContext *ctx = context->shared_context.Get();
@@ -1105,7 +1356,10 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 	ctx->OMSetRenderTargets(1, &nullrtv, nullptr);
 
 	const double corr_deg = 2.0 * acos(std::min(1.0, fabs(q_err.w))) * 57.29577951308232;
-	stab_debug_stats(context, cur, corr_deg, 0.0, clamped, "deg");
+	const double pos_mm = sqrt(posc_eye.x * posc_eye.x + posc_eye.y * posc_eye.y + posc_eye.z * posc_eye.z) *
+			      context->stab_pos_depth * 1000.0;
+	stab_debug_stats(context, cur, corr_deg, pos_mm, clamped, "deg/mm");
+	stab_telemetry_write(context, cur, pose_delay, frozen, clamped, corr_deg, posc_eye);
 	return true;
 }
 
@@ -1194,12 +1448,31 @@ static bool stab_ui_modd(obs_properties_t *props, obs_property_t *property, obs_
 	bool on = obs_data_get_bool(settings, "stabilize");
 	bool custom = obs_data_get_int(settings, "stab_preset") == 0;
 	bool nomargin = obs_data_get_double(settings, "scale_factor") < 1.01;
+	bool pos = obs_data_get_bool(settings, "stab_pos_comp");
 	bool changed = set_vis(props, "stab_zoom_warning", on && nomargin);
 	changed |= set_vis(props, "stab_preset", on);
+	changed |= set_vis(props, "stab_filter", on);
 	changed |= set_vis(props, "stab_roll_lock", on);
-	changed |= set_vis(props, "stab_smoothing", on && custom);
+	changed |= set_vis(props, "stab_pos_comp", on);
+	changed |= set_vis(props, "stab_pos_depth", on && pos);
+	changed |= set_vis(props, "stab_smooth_ms", on && custom);
 	changed |= set_vis(props, "stab_pose_delay", on);
 	changed |= set_vis(props, "stab_debug", on);
+	changed |= set_vis(props, "stab_telemetry", on);
+
+	// One Euro only smooths at this rate while the head is at rest - rename
+	// the slider so the number isn't read as a fixed delay in that mode.
+	obs_property_t *sm = obs_properties_get(props, "stab_smooth_ms");
+	if (sm) {
+		const char *want = obs_data_get_int(settings, "stab_filter") == 1
+					   ? obs_module_text("Smoothing Time at Rest (ms)")
+					   : obs_module_text("Smoothing Time (ms)");
+		const char *cur = obs_property_description(sm);
+		if (!cur || strcmp(cur, want) != 0) {
+			obs_property_set_description(sm, want);
+			changed = true;
+		}
+	}
 	return changed;
 }
 
@@ -1265,20 +1538,60 @@ static obs_properties_t *win_openvr_properties(void *data)
 	obs_property_list_add_int(p, obs_module_text("High"), 3);
 	obs_property_list_add_int(p, obs_module_text("Custom"), 0);
 	obs_property_set_modified_callback(p, stab_ui_modd);
+	p = obs_properties_add_list(props, "stab_filter", obs_module_text("Smoothing Filter"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("Damped Average (constant smoothing)"), 0);
+	obs_property_list_add_int(p, obs_module_text("One Euro (adaptive)"), 1);
+	obs_property_set_modified_callback(p, stab_ui_modd);
+	obs_property_set_long_description(
+		p, obs_module_text("Both use the Smoothing Time as the at-rest time constant. Damped Average "
+				   "suppresses shake equally at rest and in motion but trails deliberate turns. "
+				   "One Euro speeds up with head motion: far less trail, but fast movement also "
+				   "lets more shake through."));
 	p = obs_properties_add_bool(props, "stab_roll_lock", obs_module_text("Roll Lock (level horizon)"));
 	obs_property_set_long_description(
 		p, obs_module_text("Keeps the horizon gravity-level instead of following smoothed head roll."));
-	p = obs_properties_add_float_slider(props, "stab_smoothing", obs_module_text("Stabilization Strength"), 0.0, 1.0, 0.01);
-	p = obs_properties_add_int_slider(props, "stab_pose_delay", obs_module_text("Stabilization Pose Delay"), 0, 3, 1);
+	p = obs_properties_add_bool(props, "stab_pos_comp", obs_module_text("Positional Jitter Compensation (Experimental)"));
 	obs_property_set_long_description(
-		p, obs_module_text("How many compositor frames the pose lookup lags the newest frame. "
-				   "Tune so fast head turns wobble least; usually 1-2."));
+		p, obs_module_text("Counteracts small positional shake (tremor, headset wobble) at an assumed "
+				   "scene depth. Capped at 2 cm so deliberate movement is unaffected."));
+	obs_property_set_modified_callback(p, stab_ui_modd);
+	p = obs_properties_add_float_slider(props, "stab_pos_depth", obs_module_text("Reference Depth (m)"), 0.5, 20.0, 0.1);
+	obs_property_set_long_description(
+		p, obs_module_text("Scene distance that gets steadied perfectly; content at other depths keeps "
+				   "some parallax shake. 1.0-2.0 m suits close-range games; use 10-20 m for "
+				   "distant scenery / horizons (the positional correction shrinks with depth, "
+				   "so far content stops being pushed around)."));
+	p = obs_properties_add_int_slider(props, "stab_smooth_ms", obs_module_text("Smoothing Time (ms)"), 50, 2000, 10);
+	obs_property_set_long_description(
+		p, obs_module_text("Time constant of the head-direction average the view is reprojected to. "
+				   "Higher = steadier output that trails further behind deliberate turns. "
+				   "Presets: Low 200, Medium 500, High 1000."));
+	p = obs_properties_add_list(props, "stab_pose_delay", obs_module_text("Stabilization Pose Delay"),
+				    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("Auto"), -1);
+	obs_property_list_add_int(p, "0", 0);
+	obs_property_list_add_int(p, "1", 1);
+	obs_property_list_add_int(p, "2", 2);
+	obs_property_list_add_int(p, "3", 3);
+	obs_property_set_long_description(
+		p, obs_module_text("Which past compositor frame the pose lookup pairs with the mirror image. "
+				   "Auto tracks the last presented frame and adapts per session; "
+				   "pick a fixed value only if Auto misbehaves."));
 	p = obs_properties_add_bool(props, "stab_debug", obs_module_text("Stabilization: Debug Logging"));
+	p = obs_properties_add_bool(props, "stab_telemetry", obs_module_text("Stabilization: Record Telemetry (CSV)"));
+	obs_property_set_long_description(
+		p, obs_module_text("Writes per-frame pose data to stab-telemetry.csv in the OBS log folder "
+				   "for offline analysis. Leave off unless diagnosing."));
 
-	obs_data_t *settings = obs_source_get_settings(context->source);
-	ar_modd(props, NULL, settings);
-	stab_ui_modd(props, NULL, settings);
-	obs_data_release(settings);
+	// data is NULL when libobs asks for type-level properties (scripts,
+	// obs-websocket) with no live instance to read visibility state from.
+	if (context) {
+		obs_data_t *settings = obs_source_get_settings(context->source);
+		ar_modd(props, NULL, settings);
+		stab_ui_modd(props, NULL, settings);
+		obs_data_release(settings);
+	}
 
 	return props;
 }

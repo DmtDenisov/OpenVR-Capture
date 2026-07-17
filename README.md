@@ -21,11 +21,11 @@ A.
 
 Smooths head rotation (yaw/pitch/roll) in real time by reprojecting the SteamVR mirror image against headset pose data — an async-timewarp-style GPU pass that replaces the plugin's texture copy, so it adds practically no cost.
 
-- Tick **Stabilization** in the source properties, then pick a preset (Low / Medium / High) or Custom strength.
-- The adaptive filter locks the image while your head is still and catches up smoothly during deliberate turns.
+- Tick **Stabilization** in the source properties, then pick a preset (Low / Medium / High) or a Custom smoothing time.
+- The view is reprojected to a smoothed head direction. Two selectable filters share the same smoothing-time knob: **Damped Average** absorbs tremor equally at rest and in motion (deliberate turns follow with a short, constant trail), while **One Euro** adapts to head speed — much less trail on turns, at the cost of letting more shake through during fast motion.
 - **Roll Lock** keeps the horizon gravity-level instead of following head tilt.
 - Corrections hide inside the **Zoom** margin — set Zoom to ~1.2 or higher. At Zoom 1.0 stabilization still works but reveals black edges while correcting (the properties dialog shows a warning).
-- **Pose Delay** fine-tunes pose-to-frame pairing if fast head turns cause wobble (usually 1–2).
+- **Pose Delay** pairs poses to mirror frames; Auto (default) adapts per session, or pick a fixed value if Auto misbehaves.
 
 ---------
 
