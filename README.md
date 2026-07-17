@@ -25,6 +25,6 @@ Installation:
 Compiling:
 1. Pull OBS Studio source code recursively (`git clone https://github.com/obsproject/obs-studio.git --recursive`)
 2. Pull this repo, copy "plugins" into the root of OBS Studio's source code (`git clone https://github.com/Pigney/OpenVR-Capture.git`)
-3. Pull OpenVR SDK inside "deps" folder. (`git clone https://github.com/ValveSoftware/openvr.git`)
+3. Pull OpenVR SDK **v2.5.1** inside "deps" folder. (`git clone --branch v2.5.1 --depth 1 https://github.com/ValveSoftware/openvr.git`) — newer SDK headers request runtime interface versions that older SteamVR installs don't provide, which makes VR_Init fail with "Interface Not Found (105)".
 4. Add `add_obs_plugin(win-openvr PLATFORMS WINDOWS)` to the end of obs-studio/plugins/CMakeLists.txt
 5. Compile from root directory with `cmake --preset windows-x64 && cmake --build ./build_x64/plugins/win-openvr --config Release`
