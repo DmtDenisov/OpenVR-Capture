@@ -54,37 +54,46 @@ struct vec3d {
 	double x, y, z;
 };
 
-static quatd quat_from_hmd34(const vr::HmdMatrix34_t &m)
+static quatd quat_from_mat3(const double m[3][3])
 {
-	// Upper 3x3 of the row-major device-to-absolute transform
-	double tr = m.m[0][0] + m.m[1][1] + m.m[2][2];
+	// Rotation matrix (column-vector convention) -> quaternion, Shepperd's method
+	double tr = m[0][0] + m[1][1] + m[2][2];
 	quatd q;
 	if (tr > 0.0) {
 		double s = sqrt(tr + 1.0) * 2.0;
 		q.w = 0.25 * s;
-		q.x = (m.m[2][1] - m.m[1][2]) / s;
-		q.y = (m.m[0][2] - m.m[2][0]) / s;
-		q.z = (m.m[1][0] - m.m[0][1]) / s;
-	} else if (m.m[0][0] > m.m[1][1] && m.m[0][0] > m.m[2][2]) {
-		double s = sqrt(1.0 + m.m[0][0] - m.m[1][1] - m.m[2][2]) * 2.0;
-		q.w = (m.m[2][1] - m.m[1][2]) / s;
+		q.x = (m[2][1] - m[1][2]) / s;
+		q.y = (m[0][2] - m[2][0]) / s;
+		q.z = (m[1][0] - m[0][1]) / s;
+	} else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+		double s = sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2.0;
+		q.w = (m[2][1] - m[1][2]) / s;
 		q.x = 0.25 * s;
-		q.y = (m.m[0][1] + m.m[1][0]) / s;
-		q.z = (m.m[0][2] + m.m[2][0]) / s;
-	} else if (m.m[1][1] > m.m[2][2]) {
-		double s = sqrt(1.0 + m.m[1][1] - m.m[0][0] - m.m[2][2]) * 2.0;
-		q.w = (m.m[0][2] - m.m[2][0]) / s;
-		q.x = (m.m[0][1] + m.m[1][0]) / s;
+		q.y = (m[0][1] + m[1][0]) / s;
+		q.z = (m[0][2] + m[2][0]) / s;
+	} else if (m[1][1] > m[2][2]) {
+		double s = sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2.0;
+		q.w = (m[0][2] - m[2][0]) / s;
+		q.x = (m[0][1] + m[1][0]) / s;
 		q.y = 0.25 * s;
-		q.z = (m.m[1][2] + m.m[2][1]) / s;
+		q.z = (m[1][2] + m[2][1]) / s;
 	} else {
-		double s = sqrt(1.0 + m.m[2][2] - m.m[0][0] - m.m[1][1]) * 2.0;
-		q.w = (m.m[1][0] - m.m[0][1]) / s;
-		q.x = (m.m[0][2] + m.m[2][0]) / s;
-		q.y = (m.m[1][2] + m.m[2][1]) / s;
+		double s = sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2.0;
+		q.w = (m[1][0] - m[0][1]) / s;
+		q.x = (m[0][2] + m[2][0]) / s;
+		q.y = (m[1][2] + m[2][1]) / s;
 		q.z = 0.25 * s;
 	}
 	return q;
+}
+
+static quatd quat_from_hmd34(const vr::HmdMatrix34_t &mm)
+{
+	// Upper 3x3 of the row-major device-to-absolute transform
+	const double m[3][3] = {{mm.m[0][0], mm.m[0][1], mm.m[0][2]},
+				{mm.m[1][0], mm.m[1][1], mm.m[1][2]},
+				{mm.m[2][0], mm.m[2][1], mm.m[2][2]}};
+	return quat_from_mat3(m);
 }
 
 static quatd quat_conj(const quatd &q)
@@ -141,6 +150,33 @@ static vec3d quat_rotate(const quatd &q, const vec3d &v)
 	return {v.x + q.w * t.x + (q.y * t.z - q.z * t.y),
 		v.y + q.w * t.y + (q.z * t.x - q.x * t.z),
 		v.z + q.w * t.z + (q.x * t.y - q.y * t.x)};
+}
+
+// Remove the twist about the view axis so the camera's horizon is level
+// (world +y up), keeping the forward direction unchanged. Near-vertical
+// views fade back to the unleveled pose to avoid a gimbal snap.
+static quatd quat_level_roll(const quatd &q)
+{
+	const vec3d f = quat_rotate(q, vec3d{0.0, 0.0, -1.0});
+	const double fy = fabs(f.y);
+	if (!(fy < 0.98)) // near-vertical or NaN
+		return q;
+
+	// Level basis: back = -f, right = up x back, up' = back x right
+	const vec3d b = {-f.x, -f.y, -f.z};
+	vec3d x = {b.z, 0.0, -b.x}; // (0,1,0) x b
+	const double xn = sqrt(x.x * x.x + x.z * x.z);
+	if (!(xn > 1e-9))
+		return q;
+	x = {x.x / xn, 0.0, x.z / xn};
+	const vec3d y = {b.y * x.z - b.z * x.y, b.z * x.x - b.x * x.z, b.x * x.y - b.y * x.x};
+	const double m[3][3] = {{x.x, y.x, b.x}, {x.y, y.y, b.y}, {x.z, y.z, b.z}};
+	quatd ql = quat_normalize(quat_from_mat3(m));
+
+	// Fade the lock out between 0.85 and 0.98 of vertical
+	if (fy > 0.85)
+		ql = quat_slerp(ql, q, (fy - 0.85) / (0.98 - 0.85));
+	return quat_normalize(ql);
 }
 
 // Row-major 4x4 (upper 3x3 = rotation, column-vector convention)
@@ -256,6 +292,7 @@ struct win_openvr {
 	// Stabilization settings
 	bool stabilize;
 	double stab_smoothing;
+	bool stab_roll_lock;
 	int stab_pose_delay;
 	bool stab_invert_x;
 	bool stab_invert_y;
@@ -682,8 +719,23 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 	context->active_aspect_ratio = active_aspect_ratio;
 	context->stabilize = stabilize;
 
-	double stab_smoothing = obs_data_get_double(settings, "stab_smoothing");
+	double stab_smoothing;
+	switch ((int)obs_data_get_int(settings, "stab_preset")) {
+	case 1:
+		stab_smoothing = 0.35; // Low
+		break;
+	case 2:
+		stab_smoothing = 0.65; // Medium
+		break;
+	case 3:
+		stab_smoothing = 0.9; // High
+		break;
+	default:
+		stab_smoothing = obs_data_get_double(settings, "stab_smoothing"); // Custom
+		break;
+	}
 	context->stab_smoothing = std::min(std::max(stab_smoothing, 0.0), 1.0);
+	context->stab_roll_lock = obs_data_get_bool(settings, "stab_roll_lock");
 	context->stab_pose_delay = (int)obs_data_get_int(settings, "stab_pose_delay");
 
 	bool stab_invert_x = obs_data_get_bool(settings, "stab_invert_x");
@@ -711,6 +763,8 @@ static void win_openvr_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "x_offset", 0);
 	obs_data_set_default_int(settings, "y_offset", 0);
 	obs_data_set_default_bool(settings, "stabilize", false);
+	obs_data_set_default_int(settings, "stab_preset", 2);
+	obs_data_set_default_bool(settings, "stab_roll_lock", false);
 	obs_data_set_default_double(settings, "stab_smoothing", 0.65);
 	obs_data_set_default_int(settings, "stab_pose_delay", 1);
 	obs_data_set_default_bool(settings, "stab_invert_x", false);
@@ -840,7 +894,10 @@ static bool stab_update_filter(win_openvr *context, const vr::Compositor_FrameTi
 	const double beta = 0.7;
 	const double fc = fc_min + beta * context->omega_lp;
 	const double alpha = 1.0 - exp(-2.0 * kPi * fc * dt);
-	context->q_smooth = quat_normalize(quat_slerp(context->q_smooth, q_a, alpha));
+	// With roll lock, the filter chases the LEVELED pose: steady state is an
+	// exactly level horizon, and toggling the lock glides at the filter rate.
+	const quatd q_target = context->stab_roll_lock ? quat_level_roll(q_a) : q_a;
+	context->q_smooth = quat_normalize(quat_slerp(context->q_smooth, q_target, alpha));
 	context->dbg_fc = fc;
 
 	*q_a_out = q_a;
@@ -1133,6 +1190,13 @@ static void win_openvr_tick(void *data, float seconds)
 	}
 }
 
+static bool stab_preset_modd(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	bool custom = obs_data_get_int(settings, "stab_preset") == 0;
+	obs_property_set_visible(obs_properties_get(props, "stab_smoothing"), custom);
+	return true;
+}
+
 static bool ar_modd(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
 {
 	double aspect_ratio = obs_data_get_double(settings, "aspect_ratio");
@@ -1181,6 +1245,16 @@ static obs_properties_t *win_openvr_properties(void *data)
 	obs_property_set_long_description(
 		p, obs_module_text("Smooths head rotation (yaw/pitch/roll) by reprojecting the mirror frame. "
 				   "Needs Zoom above ~1.2 to have margin to work with."));
+	p = obs_properties_add_list(props, "stab_preset", obs_module_text("Stabilization Preset"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("Low"), 1);
+	obs_property_list_add_int(p, obs_module_text("Medium"), 2);
+	obs_property_list_add_int(p, obs_module_text("High"), 3);
+	obs_property_list_add_int(p, obs_module_text("Custom"), 0);
+	obs_property_set_modified_callback(p, stab_preset_modd);
+	p = obs_properties_add_bool(props, "stab_roll_lock", obs_module_text("Roll Lock (level horizon)"));
+	obs_property_set_long_description(
+		p, obs_module_text("Keeps the horizon gravity-level instead of following smoothed head roll."));
 	p = obs_properties_add_float_slider(props, "stab_smoothing", obs_module_text("Stabilization Strength"), 0.0, 1.0, 0.01);
 	p = obs_properties_add_int_slider(props, "stab_pose_delay", obs_module_text("Stabilization Pose Delay"), 0, 3, 1);
 	obs_property_set_long_description(
@@ -1192,6 +1266,7 @@ static obs_properties_t *win_openvr_properties(void *data)
 
 	obs_data_t *settings = obs_source_get_settings(context->source);
 	ar_modd(props, NULL, settings);
+	stab_preset_modd(props, NULL, settings);
 	obs_data_release(settings);
 
 	return props;
