@@ -294,8 +294,6 @@ struct win_openvr {
 	double stab_smoothing;
 	bool stab_roll_lock;
 	int stab_pose_delay;
-	bool stab_invert_x;
-	bool stab_invert_y;
 	bool stab_debug;
 
 	// Per-eye projection frustum tangents from GetProjectionRaw
@@ -318,6 +316,7 @@ struct win_openvr {
 	ComPtr<ID3D11RenderTargetView> stabRTV;
 	bool stab_shader_ok;
 	bool stab_encode_srgb;
+	bool stab_black_edges; // no crop margin: skip the clamp, show black borders
 	quatd q_e2h;     // eye-to-head rotation (canted displays)
 	quatd q_err_last; // last applied correction, reused on motion-smoothed frames
 
@@ -375,9 +374,10 @@ static bool stab_create_gpu_resources(win_openvr *context)
 
 	D3D11_SAMPLER_DESC sd = {};
 	sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-	sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-	sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-	sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sd.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
+	sd.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
+	sd.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
+	sd.BorderColor[3] = 1.0f; // opaque black outside the mirror frame
 	sd.MaxLOD = D3D11_FLOAT32_MAX;
 	if (FAILED(context->shared_device->CreateSamplerState(&sd, context->stabSampler.GetAddressOf()))) {
 		warn("stab: sampler creation failed");
@@ -521,7 +521,8 @@ static void win_openvr_init(void *data, bool forced = true)
 				context->stab_has_state = false;
 				if (context->stabilize && (context->width == context->device_width ||
 							   context->height == context->device_height)) {
-					warn("stab: crop has no margin on at least one axis - increase Zoom (1.2+ recommended)");
+					warn("stab: no crop margin (Zoom = 1) - corrections will reveal black edges; "
+					     "increase Zoom (1.2+) to hide them");
 				}
 				if (context->stabilize && context->stab_debug) {
 					info("stab: init eye=%s mirror=%ux%u crop=%ux%u at (%u,%u), projraw l=%.3f r=%.3f t=%.3f b=%.3f",
@@ -603,11 +604,10 @@ static void win_openvr_init(void *data, bool forced = true)
 							warp_ok = false;
 						}
 					}
-					if (warp_ok && !stab_corners_ok(context, quatd{1.0, 0.0, 0.0, 0.0})) {
-						warn("stab: crop touches the mirror edge, reprojection disabled - "
-						     "using crop-shift fallback (increase Zoom / reduce offsets)");
-						warp_ok = false;
-					}
+					// Edge-pinned crop: corrections cannot stay inside the
+					// frame, so run unclamped and let the border show black.
+					context->stab_black_edges =
+						warp_ok && !stab_corners_ok(context, quatd{1.0, 0.0, 0.0, 0.0});
 					context->stab_shader_ok = warp_ok;
 					if (!warp_ok)
 						warn("stab: reprojection pass unavailable, using crop-shift fallback");
@@ -737,14 +737,6 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 	context->stab_smoothing = std::min(std::max(stab_smoothing, 0.0), 1.0);
 	context->stab_roll_lock = obs_data_get_bool(settings, "stab_roll_lock");
 	context->stab_pose_delay = (int)obs_data_get_int(settings, "stab_pose_delay");
-
-	bool stab_invert_x = obs_data_get_bool(settings, "stab_invert_x");
-	bool stab_invert_y = obs_data_get_bool(settings, "stab_invert_y");
-	if (stab_invert_x != context->stab_invert_x || stab_invert_y != context->stab_invert_y)
-		context->stab_has_state = false; // reseed to avoid a mirrored-correction jump
-	context->stab_invert_x = stab_invert_x;
-	context->stab_invert_y = stab_invert_y;
-
 	context->stab_debug = obs_data_get_bool(settings, "stab_debug");
 
 	if (context->initialized && need_reinit) {
@@ -767,8 +759,6 @@ static void win_openvr_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "stab_roll_lock", false);
 	obs_data_set_default_double(settings, "stab_smoothing", 0.65);
 	obs_data_set_default_int(settings, "stab_pose_delay", 1);
-	obs_data_set_default_bool(settings, "stab_invert_x", false);
-	obs_data_set_default_bool(settings, "stab_invert_y", false);
 	obs_data_set_default_bool(settings, "stab_debug", false);
 }
 
@@ -958,10 +948,8 @@ static void stab_compute_crop(win_openvr *context, const vr::Compositor_FrameTim
 	const double fx = (double)context->device_width / ((double)context->proj_right - (double)context->proj_left);
 	const double fy = (double)context->device_height / ((double)context->proj_bottom - (double)context->proj_top);
 
-	const double sx = context->stab_invert_x ? -1.0 : 1.0;
-	const double sy = context->stab_invert_y ? -1.0 : 1.0;
-	const double dx = fx * tx * sx;
-	const double dy = -fy * ty * sy;
+	const double dx = fx * tx;
+	const double dy = -fy * ty;
 
 	if (!std::isfinite(dx) || !std::isfinite(dy)) {
 		context->stab_has_state = false; // bad pose data, reseed next frame
@@ -979,8 +967,8 @@ static void stab_compute_crop(win_openvr *context, const vr::Compositor_FrameTim
 	// the other axis keeps its full smoothing.
 	const bool clamped = (cx != nx) || (cy != ny);
 	if (clamped) {
-		const double tx_eff = (double)(cx - (long)context->x) / (fx * sx);
-		const double ty_eff = (double)(cy - (long)context->y) / (-fy * sy);
+		const double tx_eff = (double)(cx - (long)context->x) / fx;
+		const double ty_eff = (double)(cy - (long)context->y) / -fy;
 		vec3d v = {tx_eff, ty_eff, -1.0};
 		const double vn = sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
 		v = {v.x / vn, v.y / vn, v.z / vn};
@@ -1054,7 +1042,7 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 		quatd q_a;
 		if (stab_update_filter(context, cur, &q_a)) {
 			q_err = quat_mul(quat_conj(q_a), context->q_smooth);
-			if (!stab_corners_ok(context, q_err)) {
+			if (!context->stab_black_edges && !stab_corners_ok(context, q_err)) {
 				// Clamp the correction to the largest feasible fraction and
 				// absorb the excess into q_smooth (exact anti-windup).
 				const quatd q_target = context->q_smooth;
@@ -1190,11 +1178,29 @@ static void win_openvr_tick(void *data, float seconds)
 	}
 }
 
-static bool stab_preset_modd(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+static bool set_vis(obs_properties_t *props, const char *name, bool vis)
 {
-	bool custom = obs_data_get_int(settings, "stab_preset") == 0;
-	obs_property_set_visible(obs_properties_get(props, "stab_smoothing"), custom);
+	obs_property_t *p = obs_properties_get(props, name);
+	if (!p || obs_property_visible(p) == vis)
+		return false;
+	obs_property_set_visible(p, vis);
 	return true;
+}
+
+// Returning true rebuilds the whole properties panel, which kills an active
+// slider drag - so only return true when visibility actually changed.
+static bool stab_ui_modd(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	bool on = obs_data_get_bool(settings, "stabilize");
+	bool custom = obs_data_get_int(settings, "stab_preset") == 0;
+	bool nomargin = obs_data_get_double(settings, "scale_factor") < 1.01;
+	bool changed = set_vis(props, "stab_zoom_warning", on && nomargin);
+	changed |= set_vis(props, "stab_preset", on);
+	changed |= set_vis(props, "stab_roll_lock", on);
+	changed |= set_vis(props, "stab_smoothing", on && custom);
+	changed |= set_vis(props, "stab_pose_delay", on);
+	changed |= set_vis(props, "stab_debug", on);
+	return changed;
 }
 
 static bool ar_modd(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
@@ -1237,6 +1243,7 @@ static obs_properties_t *win_openvr_properties(void *data)
 
 	// Pan and zoom
 	p = obs_properties_add_float_slider(props, "scale_factor", obs_module_text("Zoom"), 1.0, 5.0, 0.01);
+	obs_property_set_modified_callback(p, stab_ui_modd);
 	p = obs_properties_add_int(props, "x_offset", obs_module_text("Horizontal Offset"), -10000, 10000, 1);
 	p = obs_properties_add_int(props, "y_offset", obs_module_text("Vertical Offset"), -10000, 10000, 1);
 
@@ -1244,14 +1251,20 @@ static obs_properties_t *win_openvr_properties(void *data)
 	p = obs_properties_add_bool(props, "stabilize", obs_module_text("Stabilization (Experimental)"));
 	obs_property_set_long_description(
 		p, obs_module_text("Smooths head rotation (yaw/pitch/roll) by reprojecting the mirror frame. "
-				   "Needs Zoom above ~1.2 to have margin to work with."));
+				   "Uses the Zoom margin to hide corrections; at Zoom 1.0 black edges appear."));
+	obs_property_set_modified_callback(p, stab_ui_modd);
+	p = obs_properties_add_text(props, "stab_zoom_warning",
+				    obs_module_text("Zoom is 1.0, so corrections will reveal black edges. "
+						    "Increase Zoom (1.2+) to hide them."),
+				    OBS_TEXT_INFO);
+	obs_property_text_set_info_type(p, OBS_TEXT_INFO_WARNING);
 	p = obs_properties_add_list(props, "stab_preset", obs_module_text("Stabilization Preset"), OBS_COMBO_TYPE_LIST,
 				    OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(p, obs_module_text("Low"), 1);
 	obs_property_list_add_int(p, obs_module_text("Medium"), 2);
 	obs_property_list_add_int(p, obs_module_text("High"), 3);
 	obs_property_list_add_int(p, obs_module_text("Custom"), 0);
-	obs_property_set_modified_callback(p, stab_preset_modd);
+	obs_property_set_modified_callback(p, stab_ui_modd);
 	p = obs_properties_add_bool(props, "stab_roll_lock", obs_module_text("Roll Lock (level horizon)"));
 	obs_property_set_long_description(
 		p, obs_module_text("Keeps the horizon gravity-level instead of following smoothed head roll."));
@@ -1260,13 +1273,11 @@ static obs_properties_t *win_openvr_properties(void *data)
 	obs_property_set_long_description(
 		p, obs_module_text("How many compositor frames the pose lookup lags the newest frame. "
 				   "Tune so fast head turns wobble least; usually 1-2."));
-	p = obs_properties_add_bool(props, "stab_invert_x", obs_module_text("Stabilization: Invert Horizontal"));
-	p = obs_properties_add_bool(props, "stab_invert_y", obs_module_text("Stabilization: Invert Vertical"));
 	p = obs_properties_add_bool(props, "stab_debug", obs_module_text("Stabilization: Debug Logging"));
 
 	obs_data_t *settings = obs_source_get_settings(context->source);
 	ar_modd(props, NULL, settings);
-	stab_preset_modd(props, NULL, settings);
+	stab_ui_modd(props, NULL, settings);
 	obs_data_release(settings);
 
 	return props;
