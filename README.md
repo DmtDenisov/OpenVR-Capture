@@ -10,6 +10,7 @@ A fork of OBS-OpenVR-Input-Plugin, originally made by Keijo "Kegetys" Ruotsalain
 ### Q. What benefits does this have over the original?
 A.
 - Real-time image stabilization: head-rotation smoothing with presets and Roll Lock, done as a GPU reprojection pass (see below).
+- Wide mode: composites both eyes into a single wider-FOV view (Eye dropdown), with a dominant-eye blend seam kept off-center. Distant scenery merges cleanly; nearby objects may ghost at the seam.
 - Crop function replaced with realtime Aspect Ratio dropdown with Zoom and Offsets.
 - Threaded initialization prevents stutter in OBS Studio.
 - OpenVR SDK updated from v1.12.5 to v2.5.1

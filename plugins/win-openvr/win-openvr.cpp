@@ -181,6 +181,18 @@ static quatd quat_level_roll(const quatd &q)
 	return quat_normalize(ql);
 }
 
+// Project an eye-frustum corner ray through the eye-to-head rotation onto
+// the head-space tangent plane. False for degenerate directions.
+static bool eye_corner_head_tangent(const quatd &q_e2h, double tx, double ty, double *px, double *py)
+{
+	const vec3d d = quat_rotate(q_e2h, vec3d{tx, ty, -1.0});
+	if (!(d.z < -0.1))
+		return false;
+	*px = d.x / -d.z;
+	*py = d.y / -d.z;
+	return true;
+}
+
 // Row-major 4x4 (upper 3x3 = rotation, column-vector convention)
 static void quat_to_mat4(const quatd &q, float *m)
 {
@@ -195,21 +207,32 @@ static void quat_to_mat4(const quatd &q, float *m)
 			m[i * 4 + j] = (i < 3 && j < 3) ? (float)r[i * 3 + j] : ((i == j) ? 1.0f : 0.0f);
 }
 
-// Reprojection pass: output pixel -> ray of the smoothed (virtual) camera ->
-// rotate into the actual camera frame -> reproject with the same asymmetric
-// frustum -> sample the mirror texture. Exact for rotation incl. roll.
+// Reprojection / composite pass: output pixel -> ray of the output camera ->
+// rotate into the actual camera frame -> reproject with each eye's asymmetric
+// frustum -> sample the mirror texture(s). Exact for rotation incl. roll.
+// Single-eye mode: rays live in the (dominant) eye's space, frC == frA.
+// Wide mode: rays live in HEAD space on a union-frustum canvas; both eyes are
+// sampled at infinity alignment (IPD ignored) and blended with the dominant
+// eye (A) winning everywhere it has coverage - eye B fades in over a narrow
+// band at A's nasal edge, so the seam sits far off-center.
 // Compiled with D3DCOMPILE_PACK_MATRIX_ROW_MAJOR so mul(M, v) is R*v for the
 // row-major matrix uploaded from quat_to_mat4.
 static const char *STAB_SHADER_SRC = R"hlsl(
 cbuffer StabParams : register(b0)
 {
-	float4 fr;   // frustum tangents: l, r, t, b
-	float4 crop; // crop rect in mirror uv: u0, v0, du, dv
-	float4 misc; // x: re-encode srgb on output
-	float4 posc; // xyz: positional correction / reference depth (eye space)
-	float4x4 Rd; // actual<-smoothed rotation
+	float4 frC;   // output canvas frustum tangents: l, r, t, b
+	float4 frA;   // eye A (dominant / single) frustum
+	float4 frB;   // eye B frustum (wide mode only)
+	float4 crop;  // crop rect in canvas uv: u0, v0, du, dv
+	float4 misc;  // x: re-encode srgb, y: wide mode, z: blend band (tangent units),
+		      // w: +1 A's nasal edge is its left, -1 it's its right
+	float4 poscA; // xyz: positional correction / reference depth (eye A space)
+	float4 poscB; // xyz: same, eye B space
+	float4x4 RdA; // eye A <- smoothed rotation
+	float4x4 RdB; // eye B <- smoothed rotation
 };
-Texture2D img : register(t0);
+Texture2D imgA : register(t0);
+Texture2D imgB : register(t1);
 SamplerState smp : register(s0);
 
 struct VSOut
@@ -236,30 +259,63 @@ float3 lin_to_srgb(float3 c)
 float4 PSMain(VSOut i) : SV_Target
 {
 	float2 uvV = crop.xy + i.uv * crop.zw;
-	float tx = fr.x + uvV.x * (fr.y - fr.x);
-	float ty = fr.w - uvV.y * (fr.w - fr.z);
-	float3 d = mul((float3x3)Rd, float3(tx, ty, -1.0)) - posc.xyz;
-	float2 t2 = d.xy / max(-d.z, 1e-6);
-	float2 uv = float2((t2.x - fr.x) / (fr.y - fr.x), (fr.w - t2.y) / (fr.w - fr.z));
-	float4 c = img.Sample(smp, uv);
+	float tx = frC.x + uvV.x * (frC.y - frC.x);
+	float ty = frC.w - uvV.y * (frC.w - frC.z);
+	float3 ray = float3(tx, ty, -1.0);
+
+	float3 dA = mul((float3x3)RdA, ray) - poscA.xyz;
+	float2 tA = dA.xy / max(-dA.z, 1e-6);
+	float2 uvA = float2((tA.x - frA.x) / (frA.y - frA.x), (frA.w - tA.y) / (frA.w - frA.z));
+
+	float4 c;
+	if (misc.y < 0.5) {
+		c = imgA.Sample(smp, uvA);
+	} else {
+		float3 dB = mul((float3x3)RdB, ray) - poscB.xyz;
+		float2 tB = dB.xy / max(-dB.z, 1e-6);
+		float2 uvB = float2((tB.x - frB.x) / (frB.y - frB.x), (frB.w - tB.y) / (frB.w - frB.z));
+
+		float inA = (dA.z < 0.0 && uvA.x >= 0.0 && uvA.x <= 1.0 && uvA.y >= 0.0 && uvA.y <= 1.0) ? 1.0 : 0.0;
+		float inB = (dB.z < 0.0 && uvB.x >= 0.0 && uvB.x <= 1.0 && uvB.y >= 0.0 && uvB.y <= 1.0) ? 1.0 : 0.0;
+		// Distance (in tangent units) from each eye's NASAL edge; the
+		// dominant eye holds full weight until the ray nears the edge of
+		// its own coverage, then hands off to B across the band.
+		float nasA = (misc.w > 0.0) ? (tA.x - frA.x) : (frA.y - tA.x);
+		float nasB = (misc.w > 0.0) ? (frB.y - tB.x) : (tB.x - frB.x);
+		float wA = inA * saturate(nasA / misc.z);
+		float wB = inB * saturate(nasB / misc.z) * (1.0 - wA);
+		float s = wA + wB;
+		c = (s > 1e-4) ? (imgA.Sample(smp, uvA) * wA + imgB.Sample(smp, uvB) * wB) / s
+			       : float4(0.0, 0.0, 0.0, 1.0);
+	}
 	if (misc.x > 0.5)
 		c.rgb = lin_to_srgb(c.rgb);
 	return c;
 }
 )hlsl";
 
+// Width of the wide-mode blend band at the dominant eye's nasal edge, in
+// tangent units (~4.5 degrees).
+#define STAB_BLEND_BAND 0.08f
+
 struct StabCBData {
-	float fr[4];
+	float frC[4];
+	float frA[4];
+	float frB[4];
 	float crop[4];
 	float misc[4];
-	float posc[4];
-	float Rd[16];
+	float poscA[4];
+	float poscB[4];
+	float RdA[16];
+	float RdB[16];
 };
 
 struct win_openvr {
 	obs_source_t *source;
 
-	bool righteye;
+	int eye_mode;  // 0 = left, 1 = right, 2 = wide (left dom), 3 = wide (right dom)
+	bool righteye; // dominant eye is the right one
+	bool wide_active;
 	double active_aspect_ratio;
 	bool ar_crop;
 
@@ -270,6 +326,7 @@ struct win_openvr {
 	//ComPtr<ID3D11DeviceContext> ctx11;
 	ComPtr<ID3D11Resource> tex;
 	ComPtr<ID3D11ShaderResourceView> mirrorSrv;
+	ComPtr<ID3D11ShaderResourceView> mirrorSrv2; // non-dominant eye (wide mode)
 	ComPtr<ID3D11Device> shared_device = nullptr;
 	ComPtr<ID3D11DeviceContext> shared_context = nullptr;
 
@@ -309,7 +366,11 @@ struct win_openvr {
 	quatd stab_q_ref; // raw pose of the displayed frame (telemetry)
 
 	// Per-eye projection frustum tangents from GetProjectionRaw
-	float proj_left, proj_right, proj_top, proj_bottom;
+	float proj_left, proj_right, proj_top, proj_bottom;     // dominant eye
+	float proj2_left, proj2_right, proj2_top, proj2_bottom; // other eye (wide)
+	// Output canvas frustum + pixel dims (single mode: == dominant eye)
+	float projc_left, projc_right, projc_top, projc_bottom;
+	unsigned int canvas_w, canvas_h;
 
 	// Auto pose-delay state
 	int stab_auto_delay;
@@ -340,7 +401,8 @@ struct win_openvr {
 	bool stab_shader_ok;
 	bool stab_encode_srgb;
 	bool stab_black_edges; // no crop margin: skip the clamp, show black borders
-	quatd q_e2h;     // eye-to-head rotation (canted displays)
+	quatd q_e2h;      // eye-to-head rotation, dominant eye (canted displays)
+	quatd q_e2h2;     // eye-to-head rotation, other eye (wide)
 	quatd q_err_last; // last applied correction, reused on motion-smoothed frames
 
 	// Debug stats (2s window)
@@ -418,6 +480,7 @@ static bool stab_create_gpu_resources(win_openvr *context)
 }
 
 static bool stab_corners_ok(win_openvr *context, const quatd &q_err_head, const vec3d &posc_eye);
+static bool stab_corners_feasible(win_openvr *context, const quatd &q_err_head, const vec3d &posc_head);
 
 // Helper to destroy OBS texture
 static void destroy_obs_texture(gs_texture_t **texture) {
@@ -466,12 +529,13 @@ static void win_openvr_init(void *data, bool forced = true)
 
 	context->texCrop.Reset();
 	context->tex.Reset();
-	// Abandon (do NOT Release) the previous mirror SRV before re-acquiring:
-	// the SteamVR runtime owns and caches that SRV, and a plain Release()
+	// Abandon (do NOT Release) the previous mirror SRVs before re-acquiring:
+	// the SteamVR runtime owns and caches them, and a plain Release()
 	// mid-session corrupts its cache - crashed in d3d11.dll on the settings
 	// re-init path (2026-07-18). Detach only nulls our pointer, so a failed
 	// GetMirrorTextureD3D11 below still can't masquerade as success.
 	context->mirrorSrv.Detach();
+	context->mirrorSrv2.Detach();
 
 	IsVRSystemInitialized = true;
 
@@ -495,12 +559,110 @@ static void win_openvr_init(void *data, bool forced = true)
 				context->device_width = desc.Width;
 				context->device_height = desc.Height;
 
+				vr::VRSystem()->GetProjectionRaw(context->righteye ? vr::Eye_Right : vr::Eye_Left,
+								 &context->proj_left, &context->proj_right,
+								 &context->proj_top, &context->proj_bottom);
+				context->q_e2h = quat_normalize(quat_from_hmd34(vr::VRSystem()->GetEyeToHeadTransform(
+					context->righteye ? vr::Eye_Right : vr::Eye_Left)));
+
+				// Wide (both-eye) composite: acquire the other eye's mirror
+				// and build a union-frustum canvas. Requires the shader pass.
+				context->wide_active = false;
+				context->canvas_w = context->device_width;
+				context->canvas_h = context->device_height;
+				context->projc_left = context->proj_left;
+				context->projc_right = context->proj_right;
+				context->projc_top = context->proj_top;
+				context->projc_bottom = context->proj_bottom;
+				if (context->eye_mode >= 2) {
+					const vr::EVREye other = context->righteye ? vr::Eye_Left : vr::Eye_Right;
+					if (!stab_create_gpu_resources(context)) {
+						warn("wide: composite shader unavailable, using the dominant eye only");
+					} else {
+						vr::VRCompositor()->GetMirrorTextureD3D11(
+							other, context->shared_device.Get(),
+							reinterpret_cast<void **>(context->mirrorSrv2.GetAddressOf()));
+						D3D11_SHADER_RESOURCE_VIEW_DESC sd1 = {}, sd2 = {};
+						if (context->mirrorSrv2) {
+							context->mirrorSrv->GetDesc(&sd1);
+							context->mirrorSrv2->GetDesc(&sd2);
+						}
+						if (!context->mirrorSrv2) {
+							warn("wide: second mirror texture unavailable, using the dominant eye only");
+						} else if (sd1.Format != sd2.Format) {
+							warn("wide: eye formats differ (%d vs %d), using the dominant eye only",
+							     (int)sd1.Format, (int)sd2.Format);
+							context->mirrorSrv2.Detach(); // runtime-owned, never Release
+						} else {
+							vr::VRSystem()->GetProjectionRaw(other, &context->proj2_left,
+											 &context->proj2_right,
+											 &context->proj2_top,
+											 &context->proj2_bottom);
+							context->q_e2h2 = quat_normalize(quat_from_hmd34(
+								vr::VRSystem()->GetEyeToHeadTransform(other)));
+							// Canvas rays live in HEAD space, so bound the canvas
+							// by each eye's frustum corners projected through its
+							// eye-to-head rotation (canted displays tilt the
+							// coverage; raw eye-frame tangents would overhang it
+							// and leave never-covered black bands). Horizontal
+							// union; vertically each eye only guarantees its
+							// shallower corners across its whole x-range, and the
+							// canvas takes the intersection of those spans.
+							// Identity e2h reduces to the plain union.
+							double lC = 1e9, rC = -1e9, tC = -1e9, bC = 1e9;
+							bool geom_ok = true;
+							for (int e = 0; e < 2 && geom_ok; e++) {
+								const quatd &qe = e ? context->q_e2h2 : context->q_e2h;
+								const double le = e ? context->proj2_left : context->proj_left;
+								const double re = e ? context->proj2_right : context->proj_right;
+								const double te = e ? context->proj2_top : context->proj_top;
+								const double be = e ? context->proj2_bottom : context->proj_bottom;
+								double xtl, ytl, xtr, ytr, xbl, ybl, xbr, ybr;
+								geom_ok = eye_corner_head_tangent(qe, le, te, &xtl, &ytl) &&
+									  eye_corner_head_tangent(qe, re, te, &xtr, &ytr) &&
+									  eye_corner_head_tangent(qe, le, be, &xbl, &ybl) &&
+									  eye_corner_head_tangent(qe, re, be, &xbr, &ybr);
+								if (!geom_ok)
+									break;
+								lC = std::min(lC, std::min(std::min(xtl, xtr), std::min(xbl, xbr)));
+								rC = std::max(rC, std::max(std::max(xtl, xtr), std::max(xbl, xbr)));
+								tC = std::max(tC, std::max(ytl, ytr));
+								bC = std::min(bC, std::min(ybl, ybr));
+							}
+							if (!geom_ok || !(rC - lC > 0.1) || !(bC - tC > 0.1)) {
+								warn("wide: degenerate combined frustum, using the dominant eye only");
+								context->mirrorSrv2.Detach(); // runtime-owned, never Release
+							} else {
+								const double densx =
+									context->device_width /
+									((double)context->proj_right - context->proj_left);
+								const double densy =
+									context->device_height /
+									((double)context->proj_bottom - context->proj_top);
+								context->projc_left = (float)lC;
+								context->projc_right = (float)rC;
+								context->projc_top = (float)tC;
+								context->projc_bottom = (float)bC;
+								context->canvas_w = (unsigned int)std::lround(densx * (rC - lC));
+								context->canvas_h = (unsigned int)std::lround(densy * (bC - tC));
+								context->wide_active = true;
+								info("wide: composite canvas %ux%u (mirror %ux%u per eye), dominant=%s",
+								     context->canvas_w, context->canvas_h,
+								     context->device_width, context->device_height,
+								     context->righteye ? "right" : "left");
+							}
+						}
+					}
+				}
+				const unsigned int base_w = context->canvas_w;
+				const unsigned int base_h = context->canvas_h;
+
 				// Pan and zoom
 				int x = 0, y = 0;
 
 				double scale_factor = context->scale_factor < 1.0 ? 1.0 : context->scale_factor;
-				unsigned int scaled_width = static_cast<unsigned int>(context->device_width / scale_factor);
-				unsigned int scaled_height = static_cast<unsigned int>(context->device_height / scale_factor);
+				unsigned int scaled_width = static_cast<unsigned int>(base_w / scale_factor);
+				unsigned int scaled_height = static_cast<unsigned int>(base_h / scale_factor);
 				context->width = scaled_width;
 				context->height = scaled_height;
 
@@ -516,46 +678,44 @@ static void win_openvr_init(void *data, bool forced = true)
 
 				int x_offset = context->x_offset;
 				int y_offset = context->y_offset;
-				if (!context->righteye) {
+				if (!context->righteye && !context->wide_active) {
 					x_offset = -x_offset;
-					x = context->device_width - scaled_width;
+					x = base_w - scaled_width;
 				}
 				x += x_offset;
 				y += y_offset;
-				if (x + context->width > context->device_width) x = context->device_width - context->width;
-				if (y + context->height > context->device_height) y = context->device_height - context->height;
+				if (x + context->width > base_w) x = base_w - context->width;
+				if (y + context->height > base_h) y = base_h - context->height;
 
 				x = std::max(0, x);
 				y = std::max(0, y);
 				context->x = x;
 				context->y = y;
 
-				if (context->stabilize) {
+				if (context->stabilize || context->wide_active) {
 					// Stabilization steals margin from the zoom crop;
 					// center the base crop so margin exists on all sides.
-					int sx = (int)(context->device_width - context->width) / 2;
-					int sy = (int)(context->device_height - context->height) / 2;
+					int sx = (int)(base_w - context->width) / 2;
+					int sy = (int)(base_h - context->height) / 2;
 					sx += context->righteye ? context->x_offset : -context->x_offset;
 					sy += context->y_offset;
-					sx = std::min(std::max(0, sx), (int)(context->device_width - context->width));
-					sy = std::min(std::max(0, sy), (int)(context->device_height - context->height));
+					sx = std::min(std::max(0, sx), (int)(base_w - context->width));
+					sy = std::min(std::max(0, sy), (int)(base_h - context->height));
 					context->x = (unsigned int)sx;
 					context->y = (unsigned int)sy;
 				}
 
-				vr::VRSystem()->GetProjectionRaw(context->righteye ? vr::Eye_Right : vr::Eye_Left,
-								 &context->proj_left, &context->proj_right,
-								 &context->proj_top, &context->proj_bottom);
 				context->stab_has_state = false;
-				if (context->stabilize && (context->width == context->device_width ||
-							   context->height == context->device_height)) {
+				if (context->stabilize && (context->width == base_w ||
+							   context->height == base_h)) {
 					warn("stab: no crop margin (Zoom = 1) - corrections will reveal black edges; "
 					     "increase Zoom (1.2+) to hide them");
 				}
 				if (context->stabilize && context->stab_debug) {
-					info("stab: init eye=%s mirror=%ux%u crop=%ux%u at (%u,%u), projraw l=%.3f r=%.3f t=%.3f b=%.3f",
+					info("stab: init eye=%s mirror=%ux%u canvas=%ux%u crop=%ux%u at (%u,%u), projraw l=%.3f r=%.3f t=%.3f b=%.3f",
 					     context->righteye ? "right" : "left",
 					     context->device_width, context->device_height,
+					     base_w, base_h,
 					     context->width, context->height, context->x, context->y,
 					     context->proj_left, context->proj_right,
 					     context->proj_top, context->proj_bottom);
@@ -612,15 +772,12 @@ static void win_openvr_init(void *data, bool forced = true)
 
 				context->stabRTV.Reset();
 				context->stab_shader_ok = false;
-				if (context->stabilize) {
+				if (context->stabilize || context->wide_active) {
 					D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
 					context->mirrorSrv->GetDesc(&srvd);
 					context->stab_encode_srgb =
 						(srvd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
 						 srvd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
-					vr::HmdMatrix34_t e2h = vr::VRSystem()->GetEyeToHeadTransform(
-						context->righteye ? vr::Eye_Right : vr::Eye_Left);
-					context->q_e2h = quat_normalize(quat_from_hmd34(e2h));
 					context->q_err_last = {1.0, 0.0, 0.0, 0.0};
 					bool warp_ok = stab_create_gpu_resources(context);
 					if (warp_ok) {
@@ -632,17 +789,34 @@ static void win_openvr_init(void *data, bool forced = true)
 							warp_ok = false;
 						}
 					}
+					if (!warp_ok && context->wide_active) {
+						// texCrop and the shared OBS texture were already
+						// created at CANVAS size; falling back to the copy
+						// path here would leave a never-written strip drawn
+						// every frame. Treat it like the other fatal init
+						// failures and let the retry loop start over.
+						warn("wide: render target creation failed, retrying init");
+						destroy_obs_texture(&context->texture);
+						context->stabRTV.Reset();
+						context->texCrop.Reset();
+						context->wide_active = false;
+						tex2D.Reset();
+						init_inprog = false;
+						vr::VR_Shutdown();
+						return;
+					}
 					// Edge-pinned crop: corrections cannot stay inside the
 					// frame, so run unclamped and let the border show black.
 					context->stab_black_edges =
-						warp_ok && !stab_corners_ok(context, quatd{1.0, 0.0, 0.0, 0.0},
-									    vec3d{0.0, 0.0, 0.0});
+						warp_ok && !stab_corners_feasible(context, quatd{1.0, 0.0, 0.0, 0.0},
+										  vec3d{0.0, 0.0, 0.0});
 					context->stab_shader_ok = warp_ok;
 					if (!warp_ok)
 						warn("stab: reprojection pass unavailable, using crop-shift fallback");
 					else if (context->stab_debug)
-						info("stab: reprojection pass active, mirror_fmt=%d srgb_reencode=%d",
-						     (int)srvd.Format, (int)context->stab_encode_srgb);
+						info("stab: reprojection pass active, mirror_fmt=%d srgb_reencode=%d wide=%d",
+						     (int)srvd.Format, (int)context->stab_encode_srgb,
+						     (int)context->wide_active);
 				}
 				tex2D.Reset();
 			}
@@ -688,6 +862,8 @@ static void win_openvr_deinit(void *data)
 	if (context->texCrop) context->texCrop.Reset();
 	if (context->tex) context->tex.Reset();
 	if (context->mirrorSrv) context->mirrorSrv.Reset();
+	if (context->mirrorSrv2) context->mirrorSrv2.Reset();
+	context->wide_active = false;
 	if (context->res) context->res.Reset();
 	if (context->shared_device) context->shared_device.Reset();
 	if (context->shared_context) context->shared_context.Reset();
@@ -712,7 +888,16 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 {
 	struct win_openvr *context = (win_openvr *)data;
 
-	bool righteye = obs_data_get_bool(settings, "righteye");
+	// Eye selection; migrate the pre-wide "righteye" bool once
+	int eye_mode;
+	if (!obs_data_has_user_value(settings, "eye_mode") && obs_data_has_user_value(settings, "righteye")) {
+		eye_mode = obs_data_get_bool(settings, "righteye") ? 1 : 0;
+		obs_data_set_int(settings, "eye_mode", eye_mode);
+	} else {
+		eye_mode = (int)obs_data_get_int(settings, "eye_mode");
+	}
+	eye_mode = std::min(std::max(eye_mode, 0), 3);
+	bool righteye = (eye_mode == 1 || eye_mode == 3); // dominant eye
 
 	// zoom/scaling
 	double scale_factor = obs_data_get_double(settings, "scale_factor");
@@ -737,7 +922,7 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 
 	// Only crop geometry / buffer-size changes require re-acquiring the
 	// mirror texture; the stabilization filter parameters below apply live.
-	bool need_reinit = righteye != context->righteye ||
+	bool need_reinit = eye_mode != context->eye_mode ||
 			   scale_factor != context->scale_factor ||
 			   x_offset != context->x_offset ||
 			   y_offset != context->y_offset ||
@@ -745,6 +930,7 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 			   active_aspect_ratio != context->active_aspect_ratio ||
 			   stabilize != context->stabilize;
 
+	context->eye_mode = eye_mode;
 	context->righteye = righteye;
 	context->scale_factor = scale_factor;
 	context->x_offset = x_offset;
@@ -807,7 +993,7 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 
 static void win_openvr_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_bool(settings, "righteye", true);
+	obs_data_set_default_int(settings, "eye_mode", 1); // Right
 	obs_data_set_default_double(settings, "aspect_ratio", -1.0);
 	obs_data_set_default_int(settings, "custom_aspect_width", 16);
 	obs_data_set_default_int(settings, "custom_aspect_height", 9);
@@ -1178,6 +1364,81 @@ static void stab_compute_crop(win_openvr *context, const vr::Compositor_FrameTim
 	stab_debug_stats(context, cur, dx, dy, clamped, "px");
 }
 
+// Wide mode: a crop corner is feasible when EITHER eye's frustum covers it
+// (the blend weights normalize, so single-eye coverage renders fine). Rays
+// live in head space on the union canvas.
+static bool stab_corners_ok_wide(win_openvr *context, const quatd &q_err_head, const vec3d &posc_head)
+{
+	const quatd qA = quat_normalize(quat_mul(quat_conj(context->q_e2h), q_err_head));
+	const quatd qB = quat_normalize(quat_mul(quat_conj(context->q_e2h2), q_err_head));
+	const vec3d pA = quat_rotate(quat_conj(context->q_e2h), posc_head);
+	const vec3d pB = quat_rotate(quat_conj(context->q_e2h2), posc_head);
+	const double W = (double)context->device_width, H = (double)context->device_height;
+	const double lA = (double)context->proj_left, rA = (double)context->proj_right;
+	const double tA = (double)context->proj_top, bA = (double)context->proj_bottom;
+	const double lB = (double)context->proj2_left, rB = (double)context->proj2_right;
+	const double tB = (double)context->proj2_top, bB = (double)context->proj2_bottom;
+	const double iuA = 2.0 * (rA - lA) / W, ivA = 2.0 * (bA - tA) / H;
+	const double iuB = 2.0 * (rB - lB) / W, ivB = 2.0 * (bB - tB) / H;
+	const double lC = (double)context->projc_left, rC = (double)context->projc_right;
+	const double tC = (double)context->projc_top, bC = (double)context->projc_bottom;
+	const double CW = (double)context->canvas_w, CH = (double)context->canvas_h;
+	const double u0 = (double)context->x / CW, u1 = (double)(context->x + context->width) / CW;
+	const double v0 = (double)context->y / CH, v1 = (double)(context->y + context->height) / CH;
+	// Sample the full crop PERIMETER (4 points per edge), not just corners:
+	// the either-eye coverage union is non-convex on canted displays (tilted
+	// per-eye quads meet in a "tent"), so all four corners can be covered by
+	// different eyes while an edge midspan escapes coverage entirely.
+	for (int s = 0; s < 16; s++) {
+		const int edge = s >> 2;
+		const double f = (double)(s & 3) / 4.0;
+		double u, v;
+		switch (edge) {
+		case 0:
+			u = u0 + f * (u1 - u0), v = v0; // top
+			break;
+		case 1:
+			u = u1, v = v0 + f * (v1 - v0); // right
+			break;
+		case 2:
+			u = u1 - f * (u1 - u0), v = v1; // bottom
+			break;
+		default:
+			u = u0, v = v1 - f * (v1 - v0); // left
+			break;
+		}
+		const double tx = lC + u * (rC - lC);
+		const double ty = bC - v * (bC - tC);
+		const vec3d ray = {tx, ty, -1.0};
+		bool ok = false;
+		const vec3d dra = quat_rotate(qA, ray);
+		const vec3d da = {dra.x - pA.x, dra.y - pA.y, dra.z - pA.z};
+		if (da.z < -0.1) {
+			const double px = da.x / -da.z, py = da.y / -da.z;
+			ok = px >= lA + iuA && px <= rA - iuA && py >= tA + ivA && py <= bA - ivA;
+		}
+		if (!ok) {
+			const vec3d drb = quat_rotate(qB, ray);
+			const vec3d db = {drb.x - pB.x, drb.y - pB.y, drb.z - pB.z};
+			if (db.z < -0.1) {
+				const double px = db.x / -db.z, py = db.y / -db.z;
+				ok = px >= lB + iuB && px <= rB - iuB && py >= tB + ivB && py <= bB - ivB;
+			}
+		}
+		if (!ok)
+			return false;
+	}
+	return true;
+}
+
+// Mode dispatch: q_err in head space, posc in head space.
+static bool stab_corners_feasible(win_openvr *context, const quatd &q_err_head, const vec3d &posc_head)
+{
+	if (context->wide_active)
+		return stab_corners_ok_wide(context, q_err_head, posc_head);
+	return stab_corners_ok(context, q_err_head, quat_rotate(quat_conj(context->q_e2h), posc_head));
+}
+
 // True when every corner of the output crop, corrected by q_err_head and the
 // positional tangent offset, still samples inside the mirror frustum (with a
 // ~2 texel safety inset).
@@ -1258,77 +1519,107 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 {
 	if (!context->stab_shader_ok || !context->mirrorSrv || !context->stabRTV)
 		return false;
+	if (context->wide_active && !context->mirrorSrv2)
+		return false;
 	if (fabsf(context->proj_right - context->proj_left) < 0.1f ||
 	    fabsf(context->proj_bottom - context->proj_top) < 0.1f)
 		return false;
 
 	quatd q_err = {1.0, 0.0, 0.0, 0.0};
-	vec3d posc_eye = {0.0, 0.0, 0.0};
+	vec3d posc_h = {0.0, 0.0, 0.0}; // head frame
 	bool clamped = false;
-
-	// On motion-smoothed frames the pose pairing is unreliable, so keep
-	// the previous correction instead of updating the filter with bad data.
-	const int pose_delay = stab_resolve_pose_delay(context);
-	quatd q_a;
-	vec3d p_a;
-	double t_a = 0.0;
 	bool frozen = false;
-	const bool have = stab_fetch_pose(cur, pose_delay, &q_a, &p_a, &t_a, &frozen);
-	if (!have)
-		context->stab_has_state = false;
+	int pose_delay = 0;
 
-	if (have && frozen && context->stab_has_state) {
-		q_err = context->q_err_last;
-		posc_eye = context->stab_posc_last;
-	} else if (have) {
-		if (stab_filter_core(context, cur, q_a, p_a, t_a)) {
-			q_err = quat_mul(quat_conj(q_a), context->q_smooth);
-			posc_eye = quat_rotate(quat_conj(context->q_e2h), context->stab_posc);
-			if (!context->stab_black_edges && !stab_corners_ok(context, q_err, posc_eye)) {
-				// Clamp the correction to the largest feasible fraction and
-				// absorb the rotational excess into the output pose
-				// (anti-windup; the positional state is self-bounded).
-				const quatd q_target = context->q_smooth;
-				const vec3d posc_full = posc_eye;
-				double lo = 0.0, hi = 1.0;
-				for (int it = 0; it < 12; it++) {
-					const double mid = 0.5 * (lo + hi);
-					const quatd q_try =
-						quat_mul(quat_conj(q_a), quat_slerp(q_a, q_target, mid));
-					const vec3d p_try = {posc_full.x * mid, posc_full.y * mid,
-							     posc_full.z * mid};
-					if (stab_corners_ok(context, q_try, p_try))
-						lo = mid;
-					else
-						hi = mid;
-				}
-				context->q_smooth = quat_normalize(quat_slerp(q_a, q_target, lo));
+	if (context->stabilize) {
+		// On motion-smoothed frames the pose pairing is unreliable, so keep
+		// the previous correction instead of updating the filter with bad data.
+		pose_delay = stab_resolve_pose_delay(context);
+		quatd q_a;
+		vec3d p_a;
+		double t_a = 0.0;
+		const bool have = stab_fetch_pose(cur, pose_delay, &q_a, &p_a, &t_a, &frozen);
+		if (!have)
+			context->stab_has_state = false;
+
+		if (have && frozen && context->stab_has_state) {
+			q_err = context->q_err_last;
+			posc_h = context->stab_posc_last;
+		} else if (have) {
+			if (stab_filter_core(context, cur, q_a, p_a, t_a)) {
 				q_err = quat_mul(quat_conj(q_a), context->q_smooth);
-				posc_eye = {posc_full.x * lo, posc_full.y * lo, posc_full.z * lo};
-				clamped = true;
+				posc_h = context->stab_posc;
+				if (!context->stab_black_edges && !stab_corners_feasible(context, q_err, posc_h)) {
+					// Clamp the correction to the largest feasible fraction and
+					// absorb the rotational excess into the output pose
+					// (anti-windup; the positional state is self-bounded).
+					const quatd q_target = context->q_smooth;
+					const vec3d posc_full = posc_h;
+					double lo = 0.0, hi = 1.0;
+					for (int it = 0; it < 12; it++) {
+						const double mid = 0.5 * (lo + hi);
+						const quatd q_try =
+							quat_mul(quat_conj(q_a), quat_slerp(q_a, q_target, mid));
+						const vec3d p_try = {posc_full.x * mid, posc_full.y * mid,
+								     posc_full.z * mid};
+						if (stab_corners_feasible(context, q_try, p_try))
+							lo = mid;
+						else
+							hi = mid;
+					}
+					context->q_smooth = quat_normalize(quat_slerp(q_a, q_target, lo));
+					q_err = quat_mul(quat_conj(q_a), context->q_smooth);
+					posc_h = {posc_full.x * lo, posc_full.y * lo, posc_full.z * lo};
+					clamped = true;
+				}
 			}
 		}
+		context->q_err_last = q_err;
+		context->stab_posc_last = posc_h;
 	}
-	context->q_err_last = q_err;
-	context->stab_posc_last = posc_eye;
 
-	// Conjugate the head-space delta into eye space (canted displays)
-	const quatd q_err_eye = quat_mul(quat_mul(quat_conj(context->q_e2h), q_err), context->q_e2h);
+	// Per-eye constants. Single mode: canvas rays live in the eye's own
+	// space, so the correction is conjugated into it (conj(e)*q*e). Wide
+	// mode: canvas rays live in HEAD space, so each eye's matrix carries
+	// the head->eye rotation itself (conj(e)*q).
+	const quatd qA = context->wide_active
+				 ? quat_mul(quat_conj(context->q_e2h), q_err)
+				 : quat_mul(quat_mul(quat_conj(context->q_e2h), q_err), context->q_e2h);
+	const vec3d pA = quat_rotate(quat_conj(context->q_e2h), posc_h);
 
 	StabCBData cb = {};
-	cb.fr[0] = context->proj_left;
-	cb.fr[1] = context->proj_right;
-	cb.fr[2] = context->proj_top;
-	cb.fr[3] = context->proj_bottom;
-	cb.crop[0] = (float)context->x / (float)context->device_width;
-	cb.crop[1] = (float)context->y / (float)context->device_height;
-	cb.crop[2] = (float)context->width / (float)context->device_width;
-	cb.crop[3] = (float)context->height / (float)context->device_height;
+	cb.frC[0] = context->projc_left;
+	cb.frC[1] = context->projc_right;
+	cb.frC[2] = context->projc_top;
+	cb.frC[3] = context->projc_bottom;
+	cb.frA[0] = context->proj_left;
+	cb.frA[1] = context->proj_right;
+	cb.frA[2] = context->proj_top;
+	cb.frA[3] = context->proj_bottom;
+	cb.crop[0] = (float)context->x / (float)context->canvas_w;
+	cb.crop[1] = (float)context->y / (float)context->canvas_h;
+	cb.crop[2] = (float)context->width / (float)context->canvas_w;
+	cb.crop[3] = (float)context->height / (float)context->canvas_h;
 	cb.misc[0] = context->stab_encode_srgb ? 1.0f : 0.0f;
-	cb.posc[0] = (float)posc_eye.x;
-	cb.posc[1] = (float)posc_eye.y;
-	cb.posc[2] = (float)posc_eye.z;
-	quat_to_mat4(q_err_eye, cb.Rd);
+	cb.misc[1] = context->wide_active ? 1.0f : 0.0f;
+	cb.misc[2] = STAB_BLEND_BAND;
+	cb.misc[3] = context->righteye ? 1.0f : -1.0f; // dominant right eye: nasal = its left edge
+	cb.poscA[0] = (float)pA.x;
+	cb.poscA[1] = (float)pA.y;
+	cb.poscA[2] = (float)pA.z;
+	quat_to_mat4(quat_normalize(qA), cb.RdA);
+	if (context->wide_active) {
+		const quatd qB = quat_mul(quat_conj(context->q_e2h2), q_err);
+		const vec3d pB = quat_rotate(quat_conj(context->q_e2h2), posc_h);
+		cb.frB[0] = context->proj2_left;
+		cb.frB[1] = context->proj2_right;
+		cb.frB[2] = context->proj2_top;
+		cb.frB[3] = context->proj2_bottom;
+		cb.poscB[0] = (float)pB.x;
+		cb.poscB[1] = (float)pB.y;
+		cb.poscB[2] = (float)pB.z;
+		quat_to_mat4(quat_normalize(qB), cb.RdB);
+	}
 
 	ID3D11DeviceContext *ctx = context->shared_context.Get();
 	ctx->UpdateSubresource(context->stabCB.Get(), 0, nullptr, &cb, 0, 0);
@@ -1342,24 +1633,28 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 	ctx->PSSetShader(context->stabPS.Get(), nullptr, 0);
 	ID3D11Buffer *cbuf = context->stabCB.Get();
 	ctx->PSSetConstantBuffers(0, 1, &cbuf);
-	ID3D11ShaderResourceView *srv = context->mirrorSrv.Get();
-	ctx->PSSetShaderResources(0, 1, &srv);
+	ID3D11ShaderResourceView *srvs[2] = {context->mirrorSrv.Get(),
+					     context->wide_active ? context->mirrorSrv2.Get()
+								  : context->mirrorSrv.Get()};
+	ctx->PSSetShaderResources(0, 2, srvs);
 	ID3D11SamplerState *smp = context->stabSampler.Get();
 	ctx->PSSetSamplers(0, 1, &smp);
 	ctx->RSSetState(context->stabRaster.Get());
 	ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
 	ctx->OMSetDepthStencilState(nullptr, 0);
 	ctx->Draw(3, 0);
-	ID3D11ShaderResourceView *nullsrv = nullptr;
-	ctx->PSSetShaderResources(0, 1, &nullsrv);
+	ID3D11ShaderResourceView *nullsrvs[2] = {nullptr, nullptr};
+	ctx->PSSetShaderResources(0, 2, nullsrvs);
 	ID3D11RenderTargetView *nullrtv = nullptr;
 	ctx->OMSetRenderTargets(1, &nullrtv, nullptr);
 
-	const double corr_deg = 2.0 * acos(std::min(1.0, fabs(q_err.w))) * 57.29577951308232;
-	const double pos_mm = sqrt(posc_eye.x * posc_eye.x + posc_eye.y * posc_eye.y + posc_eye.z * posc_eye.z) *
-			      context->stab_pos_depth * 1000.0;
-	stab_debug_stats(context, cur, corr_deg, pos_mm, clamped, "deg/mm");
-	stab_telemetry_write(context, cur, pose_delay, frozen, clamped, corr_deg, posc_eye);
+	if (context->stabilize) {
+		const double corr_deg = 2.0 * acos(std::min(1.0, fabs(q_err.w))) * 57.29577951308232;
+		const double pos_mm = sqrt(posc_h.x * posc_h.x + posc_h.y * posc_h.y + posc_h.z * posc_h.z) *
+				      context->stab_pos_depth * 1000.0;
+		stab_debug_stats(context, cur, corr_deg, pos_mm, clamped, "deg/mm");
+		stab_telemetry_write(context, cur, pose_delay, frozen, clamped, corr_deg, pA);
+	}
 	return true;
 }
 
@@ -1383,9 +1678,12 @@ static void win_openvr_render(void *data, gs_effect_t *effect)
 			if (frameTiming.m_nFrameIndex != context->lastFrame) {
 				if (context->texCrop && context->tex) {
 					bool warped = false;
-					if (context->stabilize && context->stab_shader_ok)
+					if ((context->stabilize || context->wide_active) && context->stab_shader_ok)
 						warped = stab_render_warp(context, &frameTiming);
-					if (!warped) {
+					// In wide mode the crop rect lives on the union canvas and
+					// cannot be copied out of a single mirror - skip rather
+					// than issue an out-of-bounds CopySubresourceRegion.
+					if (!warped && !context->wide_active) {
 						unsigned int crop_x = context->x;
 						unsigned int crop_y = context->y;
 						if (context->stabilize)
@@ -1498,7 +1796,17 @@ static obs_properties_t *win_openvr_properties(void *data)
 	obs_properties_t *props = obs_properties_create();
 	obs_property_t *p;
 
-	p = obs_properties_add_bool(props, "righteye", obs_module_text("Right Eye"));
+	p = obs_properties_add_list(props, "eye_mode", obs_module_text("Eye"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("Left"), 0);
+	obs_property_list_add_int(p, obs_module_text("Right"), 1);
+	obs_property_list_add_int(p, obs_module_text("Both - Wide (Left eye dominant)"), 2);
+	obs_property_list_add_int(p, obs_module_text("Both - Wide (Right eye dominant)"), 3);
+	obs_property_set_long_description(
+		p, obs_module_text("Wide composites both eyes into a wider horizontal FOV, aligned at far "
+				   "distance. The dominant eye fills the frame wherever it has coverage; the "
+				   "other eye fades in near the far edge, so the blend seam sits off-center. "
+				   "Nearby objects can ghost at the seam - distant scenery merges cleanly."));
 
 	// Preset aspect ratios
 	p = obs_properties_add_list(props, "aspect_ratio", obs_module_text("Aspect Ratio"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
