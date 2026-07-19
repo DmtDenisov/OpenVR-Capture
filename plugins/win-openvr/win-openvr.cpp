@@ -319,12 +319,6 @@ float4 PSMain(VSOut i) : SV_Target
 // Auto pose-delay vote window, in compositor frames (~1.3 s at 90 fps).
 #define STAB_AUTO_WIN 120
 
-// Matched-buffer (delayed) mode ring capacity, in frames. The ring aims to
-// hold the buffer depth on BOTH sides of the displayed frame (future + past)
-// so the zero-phase window stays symmetric; this caps worst-case VRAM, and the
-// symmetric-window logic degrades smoothing gracefully if it can't be reached.
-#define STAB_RING_MAX 32
-
 struct StabCBData {
 	float frC[4];
 	float frA[4];
@@ -396,25 +390,10 @@ struct win_openvr {
 
 	quatd stab_q_ref; // raw pose of the displayed frame (telemetry)
 
-	// Matched-buffer (delayed) mode: atomic (frame,pose) ring for exact
-	// per-frame pairing. In wide mode the ring holds BOTH eyes per slot.
-	bool stab_buffered;      // setting
-	int stab_delay_ms;       // setting: buffer depth = added output latency
-	double stab_pair_ms;     // setting: fine mirror-content pairing offset
-	bool stab_buffer_active; // ring allocated & usable
-	double stab_delay_s;
-	int stab_ring_cap, stab_ring_head, stab_ring_count;
-	double stab_ring_newest_t;
-	double stab_last_display_t; // repeated-display-frame detection
-	ComPtr<ID3D11Texture2D> stab_ring_tex[STAB_RING_MAX];
-	ComPtr<ID3D11ShaderResourceView> stab_ring_srv[STAB_RING_MAX];
-	ComPtr<ID3D11Texture2D> stab_ring_tex2[STAB_RING_MAX];  // other eye (wide)
-	ComPtr<ID3D11ShaderResourceView> stab_ring_srv2[STAB_RING_MAX];
-	double stab_ring_t[STAB_RING_MAX];
-	quatd stab_ring_q[STAB_RING_MAX];
-	vec3d stab_ring_p[STAB_RING_MAX];
-	uint8_t stab_ring_frozen[STAB_RING_MAX];
-	ComPtr<ID3D11Resource> tex2; // other-eye mirror resource (wide, for CopyResource)
+	// Pairing: how many compositor frames the mirror lags the in-flight frame
+	// (the pose each mirror frame is paired with). The live mirror is warped
+	// against GetFrameTiming(stab_pair_frames)'s pose - no buffering needed.
+	int stab_pair_frames;
 
 	// Per-eye projection frustum tangents from GetProjectionRaw
 	float proj_left, proj_right, proj_top, proj_bottom;     // dominant eye
@@ -544,25 +523,6 @@ static void destroy_obs_texture(gs_texture_t **texture) {
 	}
 }
 
-// Release the matched-buffer ring and reset its bookkeeping. The ring ComPtrs
-// live in a bzalloc'd struct that is bfree'd without destruction, so they must
-// be Reset explicitly (same contract as the other stab resources).
-static void stab_free_ring(win_openvr *context)
-{
-	for (int i = 0; i < STAB_RING_MAX; i++) {
-		context->stab_ring_srv[i].Reset();
-		context->stab_ring_tex[i].Reset();
-		context->stab_ring_srv2[i].Reset();
-		context->stab_ring_tex2[i].Reset();
-	}
-	context->stab_ring_cap = 0;
-	context->stab_ring_head = 0;
-	context->stab_ring_count = 0;
-	context->stab_ring_newest_t = 0.0;
-	context->stab_last_display_t = 0.0;
-	context->stab_buffer_active = false;
-}
-
 /// This is the messiest code i have written in my life, one day i will fix it but that day is not today.
 static void win_openvr_init(void *data, bool forced = true)
 {
@@ -600,7 +560,6 @@ static void win_openvr_init(void *data, bool forced = true)
 
 	context->texCrop.Reset();
 	context->tex.Reset();
-	context->tex2.Reset();
 	// Abandon (do NOT Release) the previous mirror SRVs before re-acquiring:
 	// the SteamVR runtime owns and caches them, and a plain Release()
 	// mid-session corrupts its cache - crashed in d3d11.dll on the settings
@@ -608,7 +567,6 @@ static void win_openvr_init(void *data, bool forced = true)
 	// GetMirrorTextureD3D11 below still can't masquerade as success.
 	context->mirrorSrv.Detach();
 	context->mirrorSrv2.Detach();
-	stab_free_ring(context); // release any ring from a previous init
 
 	IsVRSystemInitialized = true;
 
@@ -718,10 +676,6 @@ static void win_openvr_init(void *data, bool forced = true)
 								context->projc_bottom = (float)bC;
 								context->canvas_w = (unsigned int)std::lround(densx * (rC - lC));
 								context->canvas_h = (unsigned int)std::lround(densy * (bC - tC));
-								// Underlying resource of the other eye, for the
-								// buffered ring's CopyResource (harmless if unused).
-								context->tex2.Reset();
-								context->mirrorSrv2->GetResource(context->tex2.GetAddressOf());
 								context->wide_active = true;
 								info("wide: composite canvas %ux%u (mirror %ux%u per eye), dominant=%s",
 								     context->canvas_w, context->canvas_h,
@@ -895,82 +849,6 @@ static void win_openvr_init(void *data, bool forced = true)
 						info("stab: reprojection pass active, mirror_fmt=%d srgb_reencode=%d wide=%d",
 						     (int)srvd.Format, (int)context->stab_encode_srgb,
 						     (int)context->wide_active);
-
-					// Matched-buffer ring. In wide mode it holds BOTH eyes per
-					// slot (2x VRAM). Ring textures match each mirror's RESOURCE
-					// format so CopyResource is legal; the SRVs use the mirror
-					// view format (both eyes share it - verified in wide setup).
-					if (warp_ok && context->stabilize && context->stab_buffered &&
-					    (!context->wide_active || context->tex2)) {
-						const bool wide = context->wide_active;
-						D3D11_TEXTURE2D_DESC md = {};
-						tex2D->GetDesc(&md);
-						context->stab_delay_s = context->stab_delay_ms / 1000.0;
-						// The ring only spans the pairing delay plus a small
-						// bracketing margin (smoothing is a separate filter, so
-						// no long window is needed). Size from the true display
-						// refresh - the worst-case fill rate - not a hardcoded 90.
-						vr::ETrackedPropertyError perr = vr::TrackedProp_Success;
-						float hz = vr::VRSystem()->GetFloatTrackedDeviceProperty(
-							vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float, &perr);
-						if (perr != vr::TrackedProp_Success || !(hz > 30.0f) || hz > 1000.0f)
-							hz = 90.0f;
-						int cap = (int)ceil(context->stab_delay_s * (double)hz) + 4;
-						cap = std::min(std::max(cap, 6), (int)STAB_RING_MAX);
-						// Each ring texture matches its own eye's RESOURCE format
-						// so CopyResource is legal (eye B's may differ from A's).
-						DXGI_FORMAT fmtB = md.Format;
-						if (wide) {
-							ComPtr<ID3D11Texture2D> t2d;
-							if (SUCCEEDED(context->tex2.As(&t2d))) {
-								D3D11_TEXTURE2D_DESC md2 = {};
-								t2d->GetDesc(&md2);
-								fmtB = md2.Format;
-							}
-						}
-						D3D11_TEXTURE2D_DESC rd = {};
-						rd.Width = context->device_width;
-						rd.Height = context->device_height;
-						rd.MipLevels = 1;
-						rd.ArraySize = 1;
-						rd.Format = md.Format;
-						rd.SampleDesc.Count = 1;
-						rd.Usage = D3D11_USAGE_DEFAULT;
-						rd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-						D3D11_TEXTURE2D_DESC rdB = rd;
-						rdB.Format = fmtB;
-						D3D11_SHADER_RESOURCE_VIEW_DESC vd = {};
-						vd.Format = srvd.Format;
-						vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-						vd.Texture2D.MipLevels = 1;
-						bool ok = true;
-						for (int i = 0; i < cap && ok; i++) {
-							if (FAILED(context->shared_device->CreateTexture2D(
-								    &rd, nullptr, context->stab_ring_tex[i].GetAddressOf())) ||
-							    FAILED(context->shared_device->CreateShaderResourceView(
-								    context->stab_ring_tex[i].Get(), &vd,
-								    context->stab_ring_srv[i].GetAddressOf())))
-								ok = false;
-							if (ok && wide &&
-							    (FAILED(context->shared_device->CreateTexture2D(
-								     &rdB, nullptr, context->stab_ring_tex2[i].GetAddressOf())) ||
-							     FAILED(context->shared_device->CreateShaderResourceView(
-								     context->stab_ring_tex2[i].Get(), &vd,
-								     context->stab_ring_srv2[i].GetAddressOf()))))
-								ok = false;
-						}
-						if (ok) {
-							context->stab_ring_cap = cap;
-							context->stab_buffer_active = true;
-							info("stab: buffered mode on - %d ms delay, %d frames%s (~%d MB)",
-							     context->stab_delay_ms, cap, wide ? " x2 eyes" : "",
-							     (int)((uint64_t)context->device_width * context->device_height *
-								   4 * (uint64_t)cap * (wide ? 2 : 1) / (1024 * 1024)));
-						} else {
-							stab_free_ring(context);
-							warn("stab: buffered ring alloc failed, running realtime");
-						}
-					}
 				}
 				tex2D.Reset();
 			}
@@ -1015,10 +893,8 @@ static void win_openvr_deinit(void *data)
 	context->stab_shader_ok = false;
 	if (context->texCrop) context->texCrop.Reset();
 	if (context->tex) context->tex.Reset();
-	if (context->tex2) context->tex2.Reset();
 	if (context->mirrorSrv) context->mirrorSrv.Reset();
 	if (context->mirrorSrv2) context->mirrorSrv2.Reset();
-	stab_free_ring(context);
 	context->wide_active = false;
 	if (context->res) context->res.Reset();
 	if (context->shared_device) context->shared_device.Reset();
@@ -1075,21 +951,16 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 	}
 
 	bool stabilize = obs_data_get_bool(settings, "stabilize");
-	bool stab_buffered = obs_data_get_bool(settings, "stab_buffered");
-	int stab_delay_ms = std::min(std::max((int)obs_data_get_int(settings, "stab_delay_ms"), 10), 60);
 
-	// Only crop geometry / buffer-size changes require re-acquiring the
-	// mirror texture; the stabilization filter parameters below apply live.
-	// Toggling buffered mode or its depth reallocates the frame ring.
+	// Only crop geometry changes require re-acquiring the mirror texture; the
+	// stabilization filter parameters below apply live.
 	bool need_reinit = eye_mode != context->eye_mode ||
 			   scale_factor != context->scale_factor ||
 			   x_offset != context->x_offset ||
 			   y_offset != context->y_offset ||
 			   ar_crop != context->ar_crop ||
 			   active_aspect_ratio != context->active_aspect_ratio ||
-			   stabilize != context->stabilize ||
-			   stab_buffered != context->stab_buffered ||
-			   stab_delay_ms != context->stab_delay_ms;
+			   stabilize != context->stabilize;
 
 	context->eye_mode = eye_mode;
 	context->righteye = righteye;
@@ -1099,9 +970,7 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 	context->ar_crop = ar_crop;
 	context->active_aspect_ratio = active_aspect_ratio;
 	context->stabilize = stabilize;
-	context->stab_buffered = stab_buffered;
-	context->stab_delay_ms = stab_delay_ms;
-	context->stab_pair_ms = std::min(std::max(obs_data_get_double(settings, "stab_pair_ms"), -20.0), 20.0);
+	context->stab_pair_frames = std::min(std::max((int)obs_data_get_int(settings, "stab_pair_frames"), 0), 4);
 
 	int stab_smooth_ms;
 	switch ((int)obs_data_get_int(settings, "stab_preset")) {
@@ -1183,10 +1052,8 @@ static void win_openvr_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "stab_pos_depth", 1.5);
 	obs_data_set_default_int(settings, "stab_smooth_ms", 500);
 	obs_data_set_default_int(settings, "stab_filter", 0);
-	obs_data_set_default_bool(settings, "stab_buffered", false);
-	obs_data_set_default_int(settings, "stab_delay_ms", 20);
-	obs_data_set_default_double(settings, "stab_pair_ms", 0.0);
-	obs_data_set_default_int(settings, "stab_pose_delay", -1); // Auto
+	obs_data_set_default_int(settings, "stab_pair_frames", 1);
+	obs_data_set_default_int(settings, "stab_pose_delay", -1); // Auto (Tier-1 crop fallback)
 	obs_data_set_default_bool(settings, "stab_debug", false);
 	obs_data_set_default_bool(settings, "stab_telemetry", false);
 }
@@ -1760,126 +1627,6 @@ static void stab_telemetry_write(win_openvr *context, const vr::Compositor_Frame
 		fflush(context->stab_telemetry_file);
 }
 
-// Interpolate the ring's stored raw pose to time t (slerp between the two
-// bracketing samples). Clamps to the nearest end outside the ring's span.
-// Returns false only if the ring is empty.
-static bool stab_ring_pose_at(win_openvr *context, double t, quatd *q_out, vec3d *p_out)
-{
-	int lo = -1, hi = -1;
-	double lot = -1e18, hit = 1e18;
-	for (int i = 0; i < context->stab_ring_count; i++) {
-		const double ti = context->stab_ring_t[i];
-		if (ti <= t && ti > lot) {
-			lot = ti;
-			lo = i;
-		}
-		if (ti >= t && ti < hit) {
-			hit = ti;
-			hi = i;
-		}
-	}
-	if (lo < 0 && hi < 0)
-		return false;
-	if (lo < 0) {
-		*q_out = context->stab_ring_q[hi];
-		*p_out = context->stab_ring_p[hi];
-		return true;
-	}
-	if (hi < 0 || lo == hi || !(hit > lot)) {
-		*q_out = context->stab_ring_q[lo];
-		*p_out = context->stab_ring_p[lo];
-		return true;
-	}
-	const double f = (t - lot) / (hit - lot);
-	*q_out = quat_slerp(context->stab_ring_q[lo], context->stab_ring_q[hi], f);
-	const vec3d a = context->stab_ring_p[lo], b = context->stab_ring_p[hi];
-	*p_out = {a.x + f * (b.x - a.x), a.y + f * (b.y - a.y), a.z + f * (b.z - a.z)};
-	return true;
-}
-
-// Matched-buffer step: the ring's ONLY job is exact frame<->pose pairing. It
-// copies the current mirror + newest pose into the ring, selects the frame
-// ~delay old for display, and pairs it with the pose interpolated to that
-// frame's exact content time. The correctly-paired pose is then fed to the
-// normal smoothing filter (stab_filter_core) - so the steadycam Smoothing Time
-// is fully independent of the buffer depth. Returns false until the ring holds
-// a frame. *corrected_out is the filter result (false on a seed/resync frame).
-static bool stab_buffered_produce(win_openvr *context, const vr::Compositor_FrameTiming *cur, quatd *q_ref_out,
-				  ID3D11ShaderResourceView **src_out, ID3D11ShaderResourceView **srcB_out,
-				  bool *frozen_out, bool *corrected_out)
-{
-	*corrected_out = false;
-
-	quatd q;
-	vec3d p;
-	double t = 0.0;
-	bool frozen = false;
-	if (stab_fetch_pose(cur, 0, &q, &p, &t, &frozen)) {
-		const int slot = context->stab_ring_head;
-		// Snapshot both eyes and the pose atomically (same tick).
-		context->shared_context->CopyResource(context->stab_ring_tex[slot].Get(), context->tex.Get());
-		if (context->wide_active && context->tex2)
-			context->shared_context->CopyResource(context->stab_ring_tex2[slot].Get(),
-							      context->tex2.Get());
-		context->stab_ring_t[slot] = t;
-		context->stab_ring_q[slot] = q;
-		context->stab_ring_p[slot] = p;
-		context->stab_ring_frozen[slot] = frozen ? 1 : 0;
-		context->stab_ring_head = (slot + 1) % context->stab_ring_cap;
-		if (context->stab_ring_count < context->stab_ring_cap)
-			context->stab_ring_count++;
-		context->stab_ring_newest_t = t;
-	}
-	if (context->stab_ring_count == 0)
-		return false;
-
-	// Display the buffered frame closest to (newest - delay).
-	const double t_target = context->stab_ring_newest_t - context->stab_delay_s;
-	int di = -1;
-	double bd = 1e18;
-	for (int i = 0; i < context->stab_ring_count; i++) {
-		const double d = fabs(context->stab_ring_t[i] - t_target);
-		if (d < bd) {
-			bd = d;
-			di = i;
-		}
-	}
-	if (di < 0)
-		return false;
-	*src_out = context->stab_ring_srv[di].Get();
-	if (context->wide_active)
-		*srcB_out = context->stab_ring_srv2[di].Get();
-	*frozen_out = context->stab_ring_frozen[di] != 0; // surface for telemetry
-
-	// Exact pairing: interpolate the pose to the displayed frame's content
-	// time (its capture time minus the fine mirror-content offset).
-	const double content_t = context->stab_ring_t[di] - context->stab_pair_ms * 0.001;
-	quatd q_ref;
-	vec3d p_ref;
-	if (!stab_ring_pose_at(context, content_t, &q_ref, &p_ref)) {
-		q_ref = context->stab_ring_q[di];
-		p_ref = context->stab_ring_p[di];
-	}
-	q_ref = quat_normalize(q_ref);
-	*q_ref_out = q_ref;
-
-	// Nearest-slot selection can pick the SAME displayed frame twice when the
-	// OBS render cadence beats against the compositor's (e.g. 60 vs 120 fps,
-	// drifting). A repeat carries the same content_t, which would feed
-	// stab_filter_core a dt<=0 and trip its resync - blanking the correction
-	// for one frame (a periodic "jump"). Hold the existing smoothed state
-	// instead: same q_ref + unchanged q_smooth -> an identical render.
-	if (context->stab_has_state && content_t <= context->stab_last_display_t) {
-		*corrected_out = true;
-		return true;
-	}
-	context->stab_last_display_t = content_t;
-
-	// Smoothing is the normal causal filter, fed the correctly-paired pose.
-	*corrected_out = stab_filter_core(context, cur, q_ref, p_ref, content_t);
-	return true;
-}
-
 // Milestone B: render the stabilized view by reprojecting the mirror texture
 // into texCrop on the plugin's own device. Replaces the crop copy entirely.
 // Returns false if the pass could not run (caller falls back to the copy).
@@ -1897,54 +1644,29 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 	vec3d posc_h = {0.0, 0.0, 0.0}; // head frame
 	bool clamped = false;
 	bool frozen = false;
-	int pose_delay = 0;
 	ID3D11ShaderResourceView *srcA = context->mirrorSrv.Get();
 	ID3D11ShaderResourceView *srcB = context->wide_active ? context->mirrorSrv2.Get() : nullptr;
 	quatd q_a_eff = {1.0, 0.0, 0.0, 0.0}; // pose the displayed frame was rendered with
 	bool corrected = false;               // fresh q_err/posc this frame (needs clamp)
 
-	if (context->stabilize && context->stab_buffer_active) {
-		// Buffered: capture this frame, display one ~delay old, pair it with
-		// its exact interpolated pose, then run the normal smoothing filter on
-		// that pose. srcA/srcB become the displayed ring frame(s).
-		quatd q_ref;
-		bool ok = false;
-		if (stab_buffered_produce(context, cur, &q_ref, &srcA, &srcB, &frozen, &ok) && ok) {
-			q_a_eff = q_ref;
-			q_err = quat_mul(quat_conj(q_ref), context->q_smooth);
-			posc_h = context->stab_posc;
-			corrected = true;
-		}
-	} else if (context->stabilize) {
-		// Realtime: warp the live mirror against the causally filtered pose.
-		// On motion-smoothed frames the pose pairing is unreliable, so keep
-		// the previous correction instead of updating the filter with bad data.
-		pose_delay = stab_resolve_pose_delay(context);
+	if (context->stabilize) {
+		// Warp the LIVE mirror against its frame-based matched pose: the pose
+		// GetFrameTiming(stab_pair_frames) - the number of compositor frames
+		// the mirror lags the in-flight frame. Frame-based (not wall-clock), so
+		// pairing stays consistent when the frametime jitters under GPU load,
+		// and each frame (including motion-smoothed ones) is paired with the
+		// pose it was rendered with - the smoothing filter handles them.
 		quatd q_a;
 		vec3d p_a;
 		double t_a = 0.0;
-		const bool have = stab_fetch_pose(cur, pose_delay, &q_a, &p_a, &t_a, &frozen);
+		const bool have = stab_fetch_pose(cur, context->stab_pair_frames, &q_a, &p_a, &t_a, &frozen);
 		if (!have)
 			context->stab_has_state = false;
-
-		if (have && frozen && context->stab_full_lock && context->stab_lock_captured) {
-			// Full Lock must hold even on motion-smoothed frames: correct the
-			// live pose back to the captured heading (with the clamp) instead
-			// of reusing a stale delta, which would let the freeze slip.
+		else if (stab_filter_core(context, cur, q_a, p_a, t_a)) {
 			q_a_eff = q_a;
-			q_err = quat_mul(quat_conj(q_a), context->stab_lock_ref);
-			posc_h = {0.0, 0.0, 0.0};
+			q_err = quat_mul(quat_conj(q_a), context->q_smooth);
+			posc_h = context->stab_posc;
 			corrected = true;
-		} else if (have && frozen && context->stab_has_state) {
-			q_err = context->q_err_last; // already feasible; skip the clamp
-			posc_h = context->stab_posc_last;
-		} else if (have) {
-			if (stab_filter_core(context, cur, q_a, p_a, t_a)) {
-				q_a_eff = q_a;
-				q_err = quat_mul(quat_conj(q_a), context->q_smooth);
-				posc_h = context->stab_posc;
-				corrected = true;
-			}
 		}
 	}
 
@@ -2048,7 +1770,7 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 		const double pos_mm = sqrt(posc_h.x * posc_h.x + posc_h.y * posc_h.y + posc_h.z * posc_h.z) *
 				      context->stab_pos_depth * 1000.0;
 		stab_debug_stats(context, cur, corr_deg, pos_mm, clamped, "deg/mm");
-		stab_telemetry_write(context, cur, pose_delay, frozen, clamped, corr_deg, pA);
+		stab_telemetry_write(context, cur, context->stab_pair_frames, frozen, clamped, corr_deg, pA);
 	}
 	return true;
 }
@@ -2142,12 +1864,7 @@ static bool stab_ui_modd(obs_properties_t *props, obs_property_t *property, obs_
 	bool custom = obs_data_get_int(settings, "stab_preset") == 0;
 	bool nomargin = obs_data_get_double(settings, "scale_factor") < 1.01;
 	bool pos = obs_data_get_bool(settings, "stab_pos_comp");
-	bool wide = obs_data_get_int(settings, "eye_mode") >= 2;
-	bool buffered = obs_data_get_bool(settings, "stab_buffered");
 	bool changed = set_vis(props, "stab_zoom_warning", on && nomargin);
-	(void)wide;
-	// The Smoothing Time / filter controls apply in BOTH modes - the buffer
-	// only fixes pose pairing, the causal filter still does the smoothing.
 	changed |= set_vis(props, "stab_preset", on);
 	changed |= set_vis(props, "stab_filter", on);
 	changed |= set_vis(props, "stab_roll_lock", on);
@@ -2156,12 +1873,10 @@ static bool stab_ui_modd(obs_properties_t *props, obs_property_t *property, obs_
 	changed |= set_vis(props, "stab_pos_comp", on);
 	changed |= set_vis(props, "stab_pos_depth", on && pos);
 	changed |= set_vis(props, "stab_smooth_ms", on && custom);
-	// Buffered (matched-buffer) mode works in single-eye and wide.
-	changed |= set_vis(props, "stab_buffered", on);
-	changed |= set_vis(props, "stab_delay_ms", on && buffered);
-	changed |= set_vis(props, "stab_pair_ms", on && buffered);
-	// The frame-count pose delay is unused when buffered (which pairs by ms).
-	changed |= set_vis(props, "stab_pose_delay", on && !buffered);
+	changed |= set_vis(props, "stab_pair_frames", on);
+	// The old integer Auto/Manual pose delay is superseded by the frame-based
+	// Pairing Offset; only the Tier-1 crop fallback still reads it, so hide it.
+	changed |= set_vis(props, "stab_pose_delay", false);
 	changed |= set_vis(props, "stab_debug", on);
 	changed |= set_vis(props, "stab_telemetry", on);
 
@@ -2303,26 +2018,12 @@ static obs_properties_t *win_openvr_properties(void *data)
 				   "stabilized image visibly trails the mirror's own motion, the pairing is off: "
 				   "turn on Horizon Lock, shake the headset, and raise this until the horizon "
 				   "stops moving. That value is your true mirror latency (frames x frame time)."));
-	p = obs_properties_add_bool(props, "stab_buffered",
-				    obs_module_text("Buffered (exact pairing, adds latency)"));
+	p = obs_properties_add_int_slider(props, "stab_pair_frames", obs_module_text("Pairing Offset (frames)"), 0, 4, 1);
 	obs_property_set_long_description(
-		p, obs_module_text("Delays this source by the buffer depth and pairs every displayed frame with "
-				   "its exact interpolated pose - removing the sub-frame correction lag that "
-				   "whole-frame Pose Delay can't reach. Works in single-eye and wide (wide buffers "
-				   "both eyes, ~2x VRAM). Add a matching audio Sync Offset in Advanced Audio "
-				   "Properties."));
-	obs_property_set_modified_callback(p, stab_ui_modd);
-	p = obs_properties_add_int_slider(props, "stab_delay_ms", obs_module_text("Buffer / Delay (ms)"), 10, 60, 5);
-	obs_property_set_long_description(
-		p, obs_module_text("Output latency added by the buffer. This is only the pose-pairing delay - "
-				   "keep it small (one or two frames). Smoothing strength is set separately by "
-				   "Smoothing Time. Add a matching audio Sync Offset."));
-	p = obs_properties_add_float_slider(props, "stab_pair_ms", obs_module_text("Pairing Offset (ms)"), -20.0, 20.0,
-					    0.1);
-	obs_property_set_long_description(
-		p, obs_module_text("Fine mirror-content pairing offset (how old the mirror pixels are vs the pose). "
-				   "Turn on Full Lock, shake the headset, and adjust until the image is stillest. "
-				   "Sub-frame precise (one frame is ~8.3 ms at 120 fps, ~11 ms at 90)."));
+		p, obs_module_text("How many compositor frames the mirror lags the pose - the pose each frame is "
+				   "paired with. Frame-based, so it stays correct even when a heavy game makes the "
+				   "framerate jitter (a fixed millisecond offset does not). Turn on Full Lock, "
+				   "shake the headset, and adjust until the image is stillest (usually 1)."));
 	p = obs_properties_add_bool(props, "stab_debug", obs_module_text("Stabilization: Debug Logging"));
 	p = obs_properties_add_bool(props, "stab_telemetry", obs_module_text("Stabilization: Record Telemetry (CSV)"));
 	obs_property_set_long_description(
