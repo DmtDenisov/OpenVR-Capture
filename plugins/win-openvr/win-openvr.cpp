@@ -441,6 +441,31 @@ struct win_openvr {
 	uint32_t stab_poll_idx[16];
 	int64_t stab_poll_qpc[16];
 	int64_t stab_qpc_freq;
+
+	// Boundary-locked capture: the poller copies the mirror at MID-SLOT
+	// (boundary + V/2) into a 2-slot ring, fixing the capture phase at ANY
+	// canvas rate - reproducing what made canvas-120 steady (capture landing
+	// just after each record) without depending on the canvas at all.
+	// Mid-slot and not at the boundary: the native mirror update lands ~0.5 ms
+	// after the boundary, and capturing there would park ON the race forever.
+	SRWLOCK stab_gpu_lock;     // guards ALL shared_context use; SRWLOCK_INIT is {0}
+	volatile LONG stab_cap_on; // poller capture enabled (hold on, not degraded)
+	int64_t stab_cap_due;      // scheduled mid-slot copy instant (QPC); 0 = none
+	ID3D11Texture2D *cap_tex[2][2]; // [slot][eye] - raw pointers: bzalloc-safe
+	ID3D11ShaderResourceView *cap_srv[2][2];
+	int64_t cap_qpc[2];  // capture stamp (copy-issue instant)
+	uint32_t cap_idx[2]; // newest record index at capture
+	double cap_phase_ms[2];
+	volatile LONG cap_valid[2];
+	int cap_newest;
+	// Poller health: Sleep(1) silently degrades to ~15.6 ms under Windows
+	// timer coalescing, and systematically-late stamps are WORSE than tick
+	// capture - so self-measure and fall back rather than mispair quietly.
+	int64_t poll_prev_wake;
+	int poll_slow, poll_seen;
+	bool poll_degraded;
+	int stab_vsync_age; // re-probe the refresh every ~10 s (it can change)
+	uint32_t stab_last_dframe;
 	double stab_extrap_s;    // seconds to extrapolate the paired pose FORWARD
 
 	// One-frame hold. The GPU samples the mirror some ms after we read the timing
@@ -592,6 +617,23 @@ static void stab_poll_start(win_openvr *context);
 static void stab_poll_stop(win_openvr *context);
 static double stab_phase_of(win_openvr *context, uint32_t frame_index);
 
+// Stack-only RAII for the GPU lock (the context struct stays POD; SRWLOCK's
+// zero state is valid, so bzalloc initializes it). Defined before
+// win_openvr_init, which is its first user.
+struct StabGpuGuard {
+	SRWLOCK *l;
+	bool held;
+	explicit StabGpuGuard(SRWLOCK *lk) : l(lk), held(true) { AcquireSRWLockExclusive(l); }
+	void unlock()
+	{
+		if (held) {
+			ReleaseSRWLockExclusive(l);
+			held = false;
+		}
+	}
+	~StabGpuGuard() { unlock(); }
+};
+
 static void win_openvr_init(void *data, bool forced = true)
 {
 	win_openvr *context = (win_openvr *)data;
@@ -633,15 +675,48 @@ static void win_openvr_init(void *data, bool forced = true)
 		}
 	}
 
-	context->texCrop.Reset();
-	context->tex.Reset();
-	// Abandon (do NOT Release) the previous mirror SRVs before re-acquiring:
-	// the SteamVR runtime owns and caches them, and a plain Release()
-	// mid-session corrupts its cache - crashed in d3d11.dll on the settings
-	// re-init path (2026-07-18). Detach only nulls our pointer, so a failed
-	// GetMirrorTextureD3D11 below still can't masquerade as success.
-	context->mirrorSrv.Detach();
-	context->mirrorSrv2.Detach();
+	{
+		// The render thread may be mid-warp on these exact pointers (init
+		// can run on the UI thread via update/show); its D3D body holds the
+		// same lock, so this mutation cannot interleave with a use. The
+		// poller is already stopped (top of this function).
+		StabGpuGuard g(&context->stab_gpu_lock);
+		context->texCrop.Reset();
+		context->tex.Reset();
+		// Stale-session pipeline state drops INSIDE the lock too: between
+		// texCrop's recreation below and the late resets further down, a
+		// render tick could otherwise warp into the PREVIOUS session's RTV
+		// or show its held pixels (panel F1).
+		context->stabRTV.Reset();
+		context->stab_shader_ok = false;
+		context->holdSrv.Reset();
+		context->holdSrv2.Reset();
+		context->texHold.Reset();
+		context->texHold2.Reset();
+		context->hold_valid = false;
+		// Abandon (do NOT Release) the previous mirror SRVs before re-acquiring:
+		// the SteamVR runtime owns and caches them, and a plain Release()
+		// mid-session corrupts its cache - crashed in d3d11.dll on the settings
+		// re-init path (2026-07-18). Detach only nulls our pointer, so a failed
+		// GetMirrorTextureD3D11 below still can't masquerade as success.
+		context->mirrorSrv.Detach();
+		context->mirrorSrv2.Detach();
+		// Capture slots may hold a previous session's mirror size; drop them
+		// so the desc-match rebuild starts clean.
+		for (int s = 0; s < 2; s++)
+			for (int e = 0; e < 2; e++) {
+				if (context->cap_srv[s][e]) {
+					context->cap_srv[s][e]->Release();
+					context->cap_srv[s][e] = nullptr;
+				}
+				if (context->cap_tex[s][e]) {
+					context->cap_tex[s][e]->Release();
+					context->cap_tex[s][e] = nullptr;
+				}
+			}
+		context->cap_valid[0] = context->cap_valid[1] = 0;
+		context->stab_cap_due = 0;
+	}
 
 	IsVRSystemInitialized = true;
 
@@ -853,9 +928,14 @@ static void win_openvr_init(void *data, bool forced = true)
 				if (FAILED(hrRes)) {
 					warn("win_openvr_show: QueryInterface failed");
 					init_inprog = false;
-					vr::VR_Shutdown();
 					tex2D.Reset();
-					context->texCrop.Reset();
+					{
+						// Locked: a graphics-thread render may hold a
+						// live texCrop pointer (panel F2).
+						StabGpuGuard g2(&context->stab_gpu_lock);
+						context->texCrop.Reset();
+					}
+					vr::VR_Shutdown();
 					return;
 				}
 				HANDLE handle = nullptr;
@@ -863,10 +943,13 @@ static void win_openvr_init(void *data, bool forced = true)
 				if (FAILED(hrHandle)) {
 					warn("win_openvr_show: GetSharedHandle failed");
 					init_inprog = false;
-					vr::VR_Shutdown();
 					context->res.Reset();
 					tex2D.Reset();
-					context->texCrop.Reset();
+					{
+						StabGpuGuard g2(&context->stab_gpu_lock); // panel F2
+						context->texCrop.Reset();
+					}
+					vr::VR_Shutdown();
 					return;
 				}
 				context->res.Reset();
@@ -904,8 +987,11 @@ static void win_openvr_init(void *data, bool forced = true)
 						// failures and let the retry loop start over.
 						warn("wide: render target creation failed, retrying init");
 						destroy_obs_texture(&context->texture);
-						context->stabRTV.Reset();
-						context->texCrop.Reset();
+						{
+							StabGpuGuard g2(&context->stab_gpu_lock); // panel F2
+							context->stabRTV.Reset();
+							context->texCrop.Reset();
+						}
 						context->wide_active = false;
 						tex2D.Reset();
 						init_inprog = false;
@@ -963,26 +1049,48 @@ static void win_openvr_deinit(void *data)
 	stab_poll_stop(context);
 
 	if (context->texture) destroy_obs_texture(&context->texture);
-	context->stabRTV.Reset();
-	context->stabVS.Reset();
-	context->stabPS.Reset();
-	context->stabCB.Reset();
-	context->stabSampler.Reset();
-	context->stabRaster.Reset();
-	context->stab_shader_ok = false;
-	context->holdSrv.Reset();
-	context->holdSrv2.Reset();
-	context->texHold.Reset();
-	context->texHold2.Reset();
-	context->hold_valid = false;
-	if (context->texCrop) context->texCrop.Reset();
-	if (context->tex) context->tex.Reset();
-	if (context->mirrorSrv) context->mirrorSrv.Reset();
-	if (context->mirrorSrv2) context->mirrorSrv2.Reset();
-	context->wide_active = false;
-	if (context->res) context->res.Reset();
-	if (context->shared_device) context->shared_device.Reset();
-	if (context->shared_context) context->shared_context.Reset();
+	{
+		// Scoped: the guard MUST release before VR_Shutdown below (holding
+		// the GPU lock across it is the documented deadlock class), and
+		// destroy_obs_texture above must stay OUTSIDE it (obs_enter_graphics
+		// vs this lock is an ABBA deadlock with the render thread).
+		StabGpuGuard g(&context->stab_gpu_lock);
+		if (context->shared_context)
+			context->shared_context->Flush(); // drain any queued poller copy
+		for (int s = 0; s < 2; s++)
+			for (int e = 0; e < 2; e++) {
+				if (context->cap_srv[s][e]) {
+					context->cap_srv[s][e]->Release();
+					context->cap_srv[s][e] = nullptr;
+				}
+				if (context->cap_tex[s][e]) {
+					context->cap_tex[s][e]->Release();
+					context->cap_tex[s][e] = nullptr;
+				}
+			}
+		context->cap_valid[0] = context->cap_valid[1] = 0;
+		context->stab_cap_due = 0;
+		context->stabRTV.Reset();
+		context->stabVS.Reset();
+		context->stabPS.Reset();
+		context->stabCB.Reset();
+		context->stabSampler.Reset();
+		context->stabRaster.Reset();
+		context->stab_shader_ok = false;
+		context->holdSrv.Reset();
+		context->holdSrv2.Reset();
+		context->texHold.Reset();
+		context->texHold2.Reset();
+		context->hold_valid = false;
+		if (context->texCrop) context->texCrop.Reset();
+		if (context->tex) context->tex.Reset();
+		if (context->mirrorSrv) context->mirrorSrv.Reset();
+		if (context->mirrorSrv2) context->mirrorSrv2.Reset();
+		context->wide_active = false;
+		if (context->res) context->res.Reset();
+		if (context->shared_device) context->shared_device.Reset();
+		if (context->shared_context) context->shared_context.Reset();
+	}
 
 	if (context->stab_telemetry_file) {
 		fclose(context->stab_telemetry_file);
@@ -1074,10 +1182,14 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 	context->stab_pair_phase = obs_data_get_bool(settings, "stab_pair_phase");
 	bool stab_hold = obs_data_get_bool(settings, "stab_hold");
 	if (stab_hold != context->stab_hold) {
-		context->hold_valid = false; // stale pixels must not be warped
+		StabGpuGuard g(&context->stab_gpu_lock); // render may be mid-warp on these
+		context->hold_valid = false;             // stale pixels must not be warped
+		InterlockedExchange(&context->cap_valid[0], 0);
+		InterlockedExchange(&context->cap_valid[1], 0);
 		context->stab_time_reanchor = true;
 	}
 	context->stab_hold = stab_hold;
+	InterlockedExchange(&context->stab_cap_on, stab_hold ? 1 : 0);
 	bool stab_lag_auto = obs_data_get_bool(settings, "stab_lag_auto");
 	double stab_lag_base_ms = std::min(std::max(obs_data_get_double(settings, "stab_lag_base_ms"), -20.0), 40.0);
 	if (stab_lag_auto != context->stab_lag_auto || stab_lag_base_ms != context->stab_lag_base_ms) {
@@ -1317,6 +1429,9 @@ struct StabPairInfo {
 	double extrap_ms;  // forward pose extrapolation applied this frame
 	double eff_lag_ms; // effective lag actually used (auto mode varies it)
 	int lag_mode;      // classifier state: vsyncs per record (1 = native)
+	int cap_used;      // 1 = warped a boundary-locked slot, 0 = fallback path
+	double cap_phase_ms; // capture instant relative to its record boundary
+	int pair_future;   // 1 = A0 guard fired: target past the newest ring stamp
 	int eff_delay;      // cur - used frame index; differs on a fallback
 	double age_ms;      // how far back in TIME the used record sits
 	uint32_t presents;  // >1 would mean the scene texture was reused
@@ -1337,14 +1452,18 @@ struct StabPairInfo {
 // record" - the discriminator between native (1) and reprojected (2).
 static double stab_vsync_period_s(win_openvr *context)
 {
-	if (context->stab_vsync_s > 0.0)
+	// Expire the cache every ~10 s: the refresh can CHANGE mid-session
+	// (90 -> 120 via SteamVR settings), and a stale V both mis-subtracts the
+	// lag and parks the classifier ratio in its dead band indefinitely.
+	if (context->stab_vsync_s > 0.0 && ++context->stab_vsync_age < 600)
 		return context->stab_vsync_s;
+	context->stab_vsync_age = 0;
 	if (context->stab_vsync_wait > 0) {
 		context->stab_vsync_wait--; // backoff instead of hammering a dead probe
-		return 0.0;
+		return context->stab_vsync_s;
 	}
 	if (!vr::VRSystem())
-		return 0.0;
+		return context->stab_vsync_s;
 	vr::ETrackedPropertyError perr = vr::TrackedProp_Success;
 	const float hz = vr::VRSystem()->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd,
 								       vr::Prop_DisplayFrequency_Float, &perr);
@@ -1357,11 +1476,13 @@ static double stab_vsync_period_s(win_openvr *context)
 			     (int)perr, (double)hz);
 		}
 		context->stab_vsync_wait = 600;
-		return 0.0;
+		return context->stab_vsync_s; // keep a previously good value
 	}
-	context->stab_vsync_s = 1.0 / (double)hz;
-	info("stab: display %.2f Hz (vsync %.3f ms)", hz, 1000.0 / hz);
-	return context->stab_vsync_s;
+	const double v = 1.0 / (double)hz;
+	if (fabs(v - context->stab_vsync_s) > 1e-6)
+		info("stab: display %.2f Hz (vsync %.3f ms)", hz, 1000.0 / hz);
+	context->stab_vsync_s = v;
+	return v;
 }
 
 // Cadence tracker: measured record period + records-per-sample average. Runs on
@@ -1380,6 +1501,7 @@ static void stab_track_cadence(win_openvr *context, const vr::Compositor_FrameTi
 					: per;
 	}
 	context->stab_last_t0 = t0;
+	context->stab_last_dframe = dframe;
 	if (context->stab_dframe_avg <= 0.0)
 		context->stab_dframe_avg = 1.0;
 	context->stab_dframe_avg += 0.0165 * ((double)dframe - context->stab_dframe_avg);
@@ -1425,8 +1547,11 @@ static double stab_effective_lag_s(win_openvr *context)
 			// stays slow (~2.5 s): games genuinely burst to full rate for
 			// 0.4-2 s in menus and loading screens, and flapping through
 			// those is worse than riding them out.
+			// Dwell counts RECORDS, not warp ticks, so the wall time is
+			// rate-agnostic (ticks halve at canvas 30; records do not).
 			const int need = (cand > context->stab_lag_n) ? 30 : 150;
-			if (++context->stab_lag_dwell >= need) {
+			context->stab_lag_dwell += (int)(context->stab_last_dframe ? context->stab_last_dframe : 1);
+			if (context->stab_lag_dwell >= need) {
 				info("stab: auto lag %d -> %d vsyncs/record (record %.2f ms, vsync %.2f ms)",
 				     context->stab_lag_n, cand, D * 1000.0, V * 1000.0);
 				context->stab_lag_n = cand;
@@ -1547,6 +1672,110 @@ static int stab_resolve_pair_frames(win_openvr *context, const vr::Compositor_Fr
 	return raw;
 }
 
+// Lazily (re)build one capture-slot texture to match the mirror. Recreates on
+// any desc mismatch - a mirror-size change across a re-init would otherwise
+// feed CopySubresourceRegion mismatched sizes, which D3D silently drops.
+static bool stab_cap_ensure_eye(win_openvr *context, ID3D11ShaderResourceView *mirror, ID3D11Texture2D **tex,
+				ID3D11ShaderResourceView **srv)
+{
+	if (!mirror)
+		return false;
+	Microsoft::WRL::ComPtr<ID3D11Resource> res;
+	mirror->GetResource(&res);
+	Microsoft::WRL::ComPtr<ID3D11Texture2D> src;
+	if (FAILED(res.As(&src)))
+		return false;
+	D3D11_TEXTURE2D_DESC want = {};
+	src->GetDesc(&want);
+	if (*tex) {
+		D3D11_TEXTURE2D_DESC have = {};
+		(*tex)->GetDesc(&have);
+		if (have.Width == want.Width && have.Height == want.Height && have.Format == want.Format)
+			return true;
+		(*srv)->Release();
+		(*tex)->Release();
+		*srv = nullptr;
+		*tex = nullptr;
+	}
+	D3D11_TEXTURE2D_DESC d = want;
+	d.MipLevels = 1;
+	d.ArraySize = 1;
+	d.Usage = D3D11_USAGE_DEFAULT;
+	d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	d.CPUAccessFlags = 0;
+	d.MiscFlags = 0;
+	if (FAILED(context->shared_device->CreateTexture2D(&d, nullptr, tex)))
+		return false;
+	D3D11_SHADER_RESOURCE_VIEW_DESC msd = {};
+	mirror->GetDesc(&msd);
+	D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+	sd.Format = msd.Format; // keep the mirror's format: sRGB handling identical
+	sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	sd.Texture2D.MipLevels = 1;
+	if (FAILED(context->shared_device->CreateShaderResourceView(*tex, &sd, srv))) {
+		(*tex)->Release();
+		*tex = nullptr;
+		return false;
+	}
+	return true;
+}
+
+// Poller-side mid-slot capture. Stamp BEFORE the lock (the stamp names the
+// instant; only the copy waits). Flush is MANDATORY: unflushed, the copy sits
+// queued until the next render tick and the stamp lies by up to a canvas
+// period - the exact race this thread exists to kill.
+static void stab_cap_execute(win_openvr *context, int64_t due)
+{
+	StabGpuGuard g(&context->stab_gpu_lock);
+	// Stamp INSIDE the lock (panel F3): a pre-lock stamp lies about the pixels
+	// whenever the lock wait crosses a mirror update. And if we arrived late -
+	// bad wake, long wait - skip publishing rather than pair near-next-update
+	// pixels with the nominal instant: the previous slot stays valid, which is
+	// consistently one-older, never alternating.
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+	if (context->stab_qpc_freq > 0 && (double)(now.QuadPart - due) / (double)context->stab_qpc_freq > 0.0025)
+		return;
+	if (InterlockedCompareExchange(&context->stab_poll_run, 1, 1) == 0)
+		return; // shutting down
+	if (!context->shared_context || !context->mirrorSrv)
+		return;
+	if (context->wide_active && !context->mirrorSrv2)
+		return;
+	const int slot = 1 - context->cap_newest;
+	if (!stab_cap_ensure_eye(context, context->mirrorSrv.Get(), &context->cap_tex[slot][0],
+				 &context->cap_srv[slot][0]))
+		return;
+	if (context->wide_active &&
+	    !stab_cap_ensure_eye(context, context->mirrorSrv2.Get(), &context->cap_tex[slot][1],
+				 &context->cap_srv[slot][1]))
+		return;
+	InterlockedExchange(&context->cap_valid[slot], 0);
+	Microsoft::WRL::ComPtr<ID3D11Resource> src;
+	context->mirrorSrv->GetResource(&src);
+	context->shared_context->CopySubresourceRegion(context->cap_tex[slot][0], 0, 0, 0, 0, src.Get(), 0, nullptr);
+	if (context->wide_active) {
+		Microsoft::WRL::ComPtr<ID3D11Resource> src2;
+		context->mirrorSrv2->GetResource(&src2);
+		context->shared_context->CopySubresourceRegion(context->cap_tex[slot][1], 0, 0, 0, 0, src2.Get(), 0,
+							       nullptr);
+	}
+	context->shared_context->Flush();
+	const int pos = (int)context->stab_poll_pos;
+	// Pair against the NOMINAL capture instant (boundary stamp + V/2), not the
+	// actual wake: removes the 0-1.6 ms wake-quantization term from the lookup
+	// margin (panel model-transfer guard #1). The late-skip above bounds how
+	// far nominal and actual can diverge.
+	context->cap_qpc[slot] = due;
+	context->cap_idx[slot] = context->stab_poll_idx[pos];
+	// ACTUAL phase relative to the record boundary - the race telemetry.
+	// Drifting toward ~0.5 ms in native mode means racing the mirror update.
+	context->cap_phase_ms[slot] =
+		(double)(now.QuadPart - context->stab_poll_qpc[pos]) * 1000.0 / (double)context->stab_qpc_freq;
+	context->cap_newest = slot;
+	InterlockedExchange(&context->cap_valid[slot], 1);
+}
+
 // Poller: watch the compositor's frame index far faster than we render, and
 // stamp QPC at every boundary. GetFrameTiming is a read out of the runtime's
 // shared memory, so this is cheap; it never touches D3D or the mirror SRV.
@@ -1556,19 +1785,63 @@ static DWORD WINAPI stab_poll_proc(LPVOID param)
 	uint32_t last = 0;
 	bool have = false;
 	while (InterlockedCompareExchange(&context->stab_poll_run, 1, 1) != 0) {
+		LARGE_INTEGER wake;
+		QueryPerformanceCounter(&wake);
+		// Self-measure wake cadence; degrade to render-tick capture rather
+		// than mispair quietly if Sleep(1) stops being ~1 kHz.
+		double this_gap_ms = 0.0;
+		if (context->poll_prev_wake) {
+			const double gap_ms =
+				(double)(wake.QuadPart - context->poll_prev_wake) * 1000.0 / (double)context->stab_qpc_freq;
+			this_gap_ms = gap_ms;
+			context->poll_seen++;
+			if (gap_ms > 3.0)
+				context->poll_slow++;
+			if (context->poll_seen >= 1000) {
+				const bool bad = context->poll_slow * 20 >= context->poll_seen; // >5% slow
+				if (bad != context->poll_degraded) {
+					context->poll_degraded = bad;
+					warn("stab: poller wake cadence %s - %s capture",
+					     bad ? "degraded (>3 ms)" : "recovered",
+					     bad ? "reverting to render-tick" : "resuming boundary-locked");
+				}
+				context->poll_slow = 0;
+				context->poll_seen = 0;
+			}
+		}
+		context->poll_prev_wake = wake.QuadPart;
+
 		vr::Compositor_FrameTiming t = {};
 		t.m_nSize = sizeof(vr::Compositor_FrameTiming);
 		if (vr::VRCompositor() && vr::VRCompositor()->GetFrameTiming(&t, 0)) {
 			if (!have || t.m_nFrameIndex != last) {
-				LARGE_INTEGER now;
-				QueryPerformanceCounter(&now);
 				const int slot = (int)((context->stab_poll_pos + 1) & 15);
 				context->stab_poll_idx[slot] = t.m_nFrameIndex;
-				context->stab_poll_qpc[slot] = now.QuadPart;
+				context->stab_poll_qpc[slot] = wake.QuadPart;
 				// publish last: readers key off pos
 				InterlockedExchange(&context->stab_poll_pos, slot);
 				last = t.m_nFrameIndex;
 				have = true;
+				// Schedule this record's mid-slot capture. A wake that was
+				// itself late (>3 ms gap) detected this boundary late too -
+				// its stamp is already suspect, so sit this record out
+				// rather than capture off a lying reference (panel F4).
+				if (InterlockedCompareExchange(&context->stab_cap_on, 1, 1) != 0 &&
+				    !context->poll_degraded && this_gap_ms <= 3.0) {
+					const double V =
+						context->stab_vsync_s > 0.0 ? context->stab_vsync_s : 0.00833;
+					context->stab_cap_due =
+						wake.QuadPart + (int64_t)(0.5 * V * (double)context->stab_qpc_freq);
+				}
+			}
+		}
+		if (context->stab_cap_due) {
+			LARGE_INTEGER now2;
+			QueryPerformanceCounter(&now2);
+			if (now2.QuadPart >= context->stab_cap_due) {
+				const int64_t due = context->stab_cap_due;
+				context->stab_cap_due = 0;
+				stab_cap_execute(context, due);
 			}
 		}
 		Sleep(1); // ~1 kHz; a boundary is never missed by more than a ms
@@ -1599,8 +1872,11 @@ static void stab_poll_stop(win_openvr *context)
 	if (!context->stab_poll_thread)
 		return;
 	InterlockedExchange(&context->stab_poll_run, 0);
-	if (WaitForSingleObject(context->stab_poll_thread, 2000) != WAIT_OBJECT_0)
-		warn("stab: boundary poller did not exit within 2 s");
+	// INFINITE join: proceeding past a live poller frees D3D resources under
+	// it. The poller's only blocking points are bounded (the SRW lock, held
+	// microseconds by others, and Sleep(1)) - and no caller of this function
+	// may hold the GPU lock, or this join self-deadlocks.
+	WaitForSingleObject(context->stab_poll_thread, INFINITE);
 	CloseHandle(context->stab_poll_thread);
 	context->stab_poll_thread = nullptr;
 }
@@ -1654,8 +1930,6 @@ static bool stab_hold_ensure(win_openvr *context, ID3D11ShaderResourceView *srv,
 			     Microsoft::WRL::ComPtr<ID3D11Texture2D> &tex,
 			     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> &outSrv)
 {
-	if (tex && outSrv)
-		return true;
 	if (!srv || !context->shared_device)
 		return false;
 	Microsoft::WRL::ComPtr<ID3D11Resource> res;
@@ -1665,6 +1939,17 @@ static bool stab_hold_ensure(win_openvr *context, ID3D11ShaderResourceView *srv,
 		return false;
 	D3D11_TEXTURE2D_DESC d = {};
 	src->GetDesc(&d);
+	// Desc-match rebuild (panel F1): a mirror-size change across a re-init
+	// would otherwise feed CopySubresourceRegion mismatched sizes, which D3D
+	// silently drops - permanently frozen held pixels.
+	if (tex && outSrv) {
+		D3D11_TEXTURE2D_DESC have = {};
+		tex->GetDesc(&have);
+		if (have.Width == d.Width && have.Height == d.Height && have.Format == d.Format)
+			return true;
+		outSrv.Reset();
+		tex.Reset();
+	}
 	d.MipLevels = 1;
 	d.ArraySize = 1;
 	d.Usage = D3D11_USAGE_DEFAULT;
@@ -2159,8 +2444,8 @@ static void stab_telemetry_write(win_openvr *context, const vr::Compositor_Frame
 		}
 		info("stab: recording telemetry to %s", path);
 		fprintf(context->stab_telemetry_file,
-			"time,frame,delay,dframe,phase_ms,extrap_ms,eff_lag_ms,lag_mode,vsync_ok,vsync_ms,"
-			"vsync_ctr,req_delay,eff_delay,age_ms,"
+			"time,frame,delay,dframe,phase_ms,extrap_ms,eff_lag_ms,lag_mode,cap_used,cap_phase_ms,"
+			"pair_future,vsync_ok,vsync_ms,vsync_ctr,req_delay,eff_delay,age_ms,"
 			"presents,dropped,mispres,flags,"
 			"predicted,vs_ready,vs_view,crender_start_ms,crender_gpu_ms,crender_cpu_ms,"
 			"newframe_ready_ms,transfer_ms,frozen,clamped,qa_w,qa_x,qa_y,qa_z,qs_w,qs_x,qs_y,qs_z,"
@@ -2170,11 +2455,12 @@ static void stab_telemetry_write(win_openvr *context, const vr::Compositor_Frame
 	const quatd &qa = context->stab_q_ref;
 	const quatd &qs = context->q_smooth;
 	fprintf(context->stab_telemetry_file,
-		"%.6f,%u,%d,%u,%.4f,%.4f,%.4f,%d,%d,%.4f,%llu,%d,%d,%.4f,%u,%u,%u,0x%X,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,"
+		"%.6f,%u,%d,%u,%.4f,%.4f,%.4f,%d,%d,%.4f,%d,%d,%.4f,%llu,%d,%d,%.4f,%u,%u,%u,0x%X,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,"
 		"%d,%d,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,"
 		"%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.4f,%.6f,%.6f,%.6f\n",
 		context->prev_pose_time, cur->m_nFrameIndex, pose_delay, pr.dframe, pr.phase_ms, pr.extrap_ms,
-		pr.eff_lag_ms, pr.lag_mode, pr.vsync_ok, pr.vsync_phase_ms, (unsigned long long)pr.vsync_counter,
+		pr.eff_lag_ms, pr.lag_mode, pr.cap_used, pr.cap_phase_ms, pr.pair_future, pr.vsync_ok,
+		pr.vsync_phase_ms, (unsigned long long)pr.vsync_counter,
 		pr.req_delay, pr.eff_delay, pr.age_ms,
 		pr.presents, pr.dropped, pr.mispres, pr.flags, pr.predicted, pr.vs_ready, pr.vs_view,
 		pr.crender_start_ms, pr.crender_gpu_ms, pr.crender_cpu_ms, pr.newframe_ready_ms, pr.transfer_ms,
@@ -2205,13 +2491,32 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 	bool frozen = false;
 	StabPairInfo pair = {}; // req_delay -1 until the pairing runs
 	pair.req_delay = -1;
-	// When holding, warp LAST tick's pixels - by now the record describing them
-	// exists, so the pose is a lookup instead of a prediction.
-	const bool use_hold = context->stab_hold && context->hold_valid && context->holdSrv &&
+	// Boundary-locked capture first: warp the newest complete poller slot -
+	// pixels captured at a fixed mid-slot phase regardless of canvas rate.
+	// Falls back to the render-tick hold when the poller is degraded or the
+	// slots are not ready, then to the live mirror.
+	int cap_slot = -1;
+	if (context->stab_hold && !context->poll_degraded && context->stab_poll_thread) {
+		for (int i = 0; i < 2; i++) {
+			const int s = (context->cap_newest + 2 - i) & 1;
+			if (InterlockedCompareExchange(&context->cap_valid[s], 1, 1) && context->cap_srv[s][0] &&
+			    (!context->wide_active || context->cap_srv[s][1])) {
+				cap_slot = s;
+				break;
+			}
+		}
+	}
+	const bool use_cap = cap_slot >= 0;
+	const bool use_hold = !use_cap && context->stab_hold && context->hold_valid && context->holdSrv &&
 			      (!context->wide_active || context->holdSrv2);
-	ID3D11ShaderResourceView *srcA = use_hold ? context->holdSrv.Get() : context->mirrorSrv.Get();
+	ID3D11ShaderResourceView *srcA = use_cap    ? context->cap_srv[cap_slot][0]
+					 : use_hold ? context->holdSrv.Get()
+						    : context->mirrorSrv.Get();
 	ID3D11ShaderResourceView *srcB =
-		context->wide_active ? (use_hold ? context->holdSrv2.Get() : context->mirrorSrv2.Get()) : nullptr;
+		context->wide_active ? (use_cap    ? context->cap_srv[cap_slot][1]
+					: use_hold ? context->holdSrv2.Get()
+						   : context->mirrorSrv2.Get())
+				     : nullptr;
 	quatd q_a_eff = {1.0, 0.0, 0.0, 0.0}; // pose the displayed frame was rendered with
 	bool corrected = false;               // fresh q_err/posc this frame (needs clamp)
 
@@ -2228,7 +2533,36 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 		stab_track_cadence(context, cur);
 		const double eff_lag = stab_effective_lag_s(context);
 		int want;
-		if (use_hold) {
+		if (use_cap) {
+			// Pairing bound by the slot's own capture stamp. On a failed
+			// ring lookup, REUSE the last pairing - never switch to a
+			// different selector mid-session: a consistent repeat glides
+			// through the reanchor, an alternating rule-change is shake.
+			const int64_t target = context->cap_qpc[cap_slot] +
+					       (int64_t)(eff_lag * (double)context->stab_qpc_freq);
+			uint32_t idx = stab_record_at_qpc(context, target);
+			// Future-target guard (panel A0, HIGH): with positive lag the
+			// target can sit past the newest ring stamp while its deciding
+			// boundary has ALREADY happened - the render gate saw the new
+			// index up to ~1 ms before the poller stamped it. The ring then
+			// returns the previous record: found-but-WRONG, alternating with
+			// tick phase. In that window the render thread's own
+			// GetFrameTiming(0) is fresher than the ring: the newest record
+			// IS cur.
+			{
+				const int rpos = (int)context->stab_poll_pos;
+				if (target > context->stab_poll_qpc[rpos] &&
+				    (int32_t)(cur->m_nFrameIndex - context->stab_poll_idx[rpos]) > 0) {
+					idx = cur->m_nFrameIndex;
+					pair.pair_future = 1;
+				}
+			}
+			want = idx ? (int)(cur->m_nFrameIndex - idx)
+				   : (context->stab_has_sel ? (int)(cur->m_nFrameIndex - context->stab_last_sel)
+							    : context->stab_pair_frames);
+			want = std::min(std::max(want, 0), 4);
+			context->stab_extrap_s = 0.0; // never predict from a capture
+		} else if (use_hold) {
 			// Retrospective pairing: which record was newest when the GPU
 			// actually sampled the pixels we are about to warp? That instant
 			// is hold_qpc + the effective lag, and it is now in the past, so
@@ -2297,6 +2631,8 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 		pair.extrap_ms = context->stab_extrap_s * 1000.0;
 		pair.eff_lag_ms = eff_lag * 1000.0;
 		pair.lag_mode = context->stab_lag_n; // vsyncs/record held (1 = native)
+		pair.cap_used = use_cap ? 1 : 0;
+		pair.cap_phase_ms = use_cap ? context->cap_phase_ms[cap_slot] : -1.0;
 		float since_vsync = 0.0f;
 		uint64_t vsync_frame = 0;
 		pair.vsync_ok = (vr::VRSystem() &&
@@ -2409,9 +2745,10 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 	ctx->Draw(3, 0);
 	ID3D11ShaderResourceView *nullsrvs[2] = {nullptr, nullptr};
 	ctx->PSSetShaderResources(0, 2, nullsrvs);
-	// Capture AFTER the draw, so the hold buffer is never bound as both source
-	// and copy target in the same call.
-	if (context->stab_hold)
+	// Legacy render-tick capture: only when the poller cannot provide slots
+	// (thread failed or cadence degraded). With the boundary-locked capture
+	// healthy, copying here too would just double the bandwidth.
+	if (context->stab_hold && (context->poll_degraded || !context->stab_poll_thread))
 		stab_hold_capture(context, ctx, cur);
 	ID3D11RenderTargetView *nullrtv = nullptr;
 	ctx->OMSetRenderTargets(1, &nullrtv, nullptr);
@@ -2444,6 +2781,10 @@ static void win_openvr_render(void *data, gs_effect_t *effect)
 		frameTiming.m_nSize = sizeof(vr::Compositor_FrameTiming);
 		if (vr::VRCompositor()->GetFrameTiming(&frameTiming, 0)) {
 			if (frameTiming.m_nFrameIndex != context->lastFrame) {
+				// One lock over the whole D3D body: pointer checks and
+				// use become atomic against the poller's capture and
+				// against init/update mutating the sources.
+				StabGpuGuard gpu(&context->stab_gpu_lock);
 				if (context->texCrop && context->tex) {
 					bool warped = false;
 					if ((context->stabilize || context->wide_active) && context->stab_shader_ok)
