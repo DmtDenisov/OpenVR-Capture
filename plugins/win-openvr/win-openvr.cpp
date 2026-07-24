@@ -529,6 +529,11 @@ struct win_openvr {
 	uint32_t dbg_window_frame_index;
 	double dbg_max_dx, dbg_max_dy;
 	uint32_t dbg_clamped;
+	// Calibration score accumulator (Freeze View): stddev of the per-frame
+	// correction DELTA - corr itself holds the accumulated offset when frozen,
+	// its delta is what shake looks like.
+	double dbg_cal_prev, dbg_cal_sum, dbg_cal_sum2;
+	int dbg_cal_n;
 };
 
 // Compile the reprojection shaders and create the fixed GPU objects on the
@@ -1162,8 +1167,30 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 	context->ar_crop = ar_crop;
 	context->active_aspect_ratio = active_aspect_ratio;
 	context->stabilize = stabilize;
+	// One-time migration to the collapsed UI (schema 1): auto pairing, auto
+	// lag and the one-frame hold become the only model. A Mirror Lag that was
+	// hand-calibrated in the old manual mode seeds the new single slider;
+	// retired keys get their user values cleared so the new defaults win.
+	// Keys stay readable (scripts/websocket) - only the UI is gone.
+	if ((int)obs_data_get_int(settings, "stab_schema") < 1) {
+		if (obs_data_has_user_value(settings, "stab_pair_lag_ms") &&
+		    !obs_data_has_user_value(settings, "stab_lag_base_ms") &&
+		    obs_data_get_bool(settings, "stab_pair_auto") &&
+		    !obs_data_get_bool(settings, "stab_lag_auto"))
+			obs_data_set_double(settings, "stab_lag_base_ms",
+					    obs_data_get_double(settings, "stab_pair_lag_ms"));
+		obs_data_unset_user_value(settings, "stab_hold");
+		obs_data_unset_user_value(settings, "stab_pair_auto");
+		obs_data_unset_user_value(settings, "stab_lag_auto");
+		obs_data_unset_user_value(settings, "stab_pair_phase");
+		obs_data_set_int(settings, "stab_schema", 1);
+	}
+
 	int stab_pair_frames = std::min(std::max((int)obs_data_get_int(settings, "stab_pair_frames"), 0), 4);
-	bool stab_pair_auto = obs_data_get_bool(settings, "stab_pair_auto");
+	// Forced on since UI v1 (collapsed panel): time-based pairing is the only
+	// model that survived the investigation. The settings keys are accepted
+	// but no longer steer these.
+	bool stab_pair_auto = true;
 	double stab_pair_lag_ms = std::min(std::max(obs_data_get_double(settings, "stab_pair_lag_ms"), -20.0), 40.0);
 	if (stab_pair_frames != context->stab_pair_frames || stab_pair_auto != context->stab_pair_auto ||
 	    stab_pair_lag_ms != context->stab_pair_lag_ms) {
@@ -1179,7 +1206,7 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 	context->stab_pair_frames = stab_pair_frames;
 	context->stab_pair_auto = stab_pair_auto;
 	context->stab_pair_lag_ms = stab_pair_lag_ms;
-	context->stab_pair_phase = obs_data_get_bool(settings, "stab_pair_phase");
+	context->stab_pair_phase = true; // forced: poller phase always on (UI v1)
 	bool stab_hold = obs_data_get_bool(settings, "stab_hold");
 	if (stab_hold != context->stab_hold) {
 		StabGpuGuard g(&context->stab_gpu_lock); // render may be mid-warp on these
@@ -1190,7 +1217,7 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 	}
 	context->stab_hold = stab_hold;
 	InterlockedExchange(&context->stab_cap_on, stab_hold ? 1 : 0);
-	bool stab_lag_auto = obs_data_get_bool(settings, "stab_lag_auto");
+	bool stab_lag_auto = true; // forced: classifier is identity at n=1 (UI v1)
 	double stab_lag_base_ms = std::min(std::max(obs_data_get_double(settings, "stab_lag_base_ms"), -20.0), 40.0);
 	if (stab_lag_auto != context->stab_lag_auto || stab_lag_base_ms != context->stab_lag_base_ms) {
 		context->stab_lag_n = 1; // re-classify from scratch
@@ -1281,11 +1308,12 @@ static void win_openvr_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "stab_smooth_ms", 500);
 	obs_data_set_default_int(settings, "stab_filter", 0);
 	obs_data_set_default_int(settings, "stab_pair_frames", 1);
-	obs_data_set_default_bool(settings, "stab_pair_auto", false);
 	obs_data_set_default_double(settings, "stab_pair_lag_ms", 12.5);
-	obs_data_set_default_bool(settings, "stab_pair_phase", false);
-	obs_data_set_default_bool(settings, "stab_hold", false);
-	obs_data_set_default_bool(settings, "stab_lag_auto", false);
+	obs_data_set_default_bool(settings, "stab_hold", true);
+	obs_data_set_default_bool(settings, "stab_lag_auto", true);
+	obs_data_set_default_bool(settings, "stab_pair_auto", true);
+	obs_data_set_default_bool(settings, "stab_pair_phase", true);
+	obs_data_set_default_bool(settings, "stab_advanced", false);
 	obs_data_set_default_double(settings, "stab_lag_base_ms", 8.5);
 	obs_data_set_default_int(settings, "stab_pose_delay", -1); // Auto (Tier-1 crop fallback)
 	obs_data_set_default_bool(settings, "stab_debug", false);
@@ -2227,7 +2255,22 @@ static bool stab_update_filter(win_openvr *context, const vr::Compositor_FrameTi
 static void stab_debug_stats(win_openvr *context, const vr::Compositor_FrameTiming *cur, double corr_a,
 			     double corr_b, bool clamped, const char *unit)
 {
-	if (!context->stab_debug)
+	// Calibration score runs whenever Freeze View is on, independent of Debug
+	// Logging - it IS the calibration instrument: sweep Mirror Lag until the
+	// printed number bottoms out. No VR legs required.
+	if (context->stab_full_lock) {
+		if (context->dbg_cal_n > 0) {
+			const double d = corr_a - context->dbg_cal_prev;
+			context->dbg_cal_sum += d;
+			context->dbg_cal_sum2 += d * d;
+		}
+		context->dbg_cal_prev = corr_a;
+		context->dbg_cal_n++;
+	} else {
+		context->dbg_cal_n = 0;
+		context->dbg_cal_sum = context->dbg_cal_sum2 = 0.0;
+	}
+	if (!context->stab_debug && !context->stab_full_lock)
 		return;
 	if (fabs(corr_a) > context->dbg_max_dx)
 		context->dbg_max_dx = fabs(corr_a);
@@ -2237,9 +2280,20 @@ static void stab_debug_stats(win_openvr *context, const vr::Compositor_FrameTimi
 		context->dbg_clamped++;
 	const double elapsed = context->prev_pose_time - context->dbg_window_start;
 	if (elapsed >= 2.0) {
-		info("stab: compositor=%.1f fps, tau=%.0f ms, max corr=(%.2f, %.2f) %s, clamped %u frames",
-		     (double)(cur->m_nFrameIndex - context->dbg_window_frame_index) / elapsed,
-		     context->stab_tau * 1000.0, context->dbg_max_dx, context->dbg_max_dy, unit, context->dbg_clamped);
+		if (context->stab_debug)
+			info("stab: compositor=%.1f fps, tau=%.0f ms, max corr=(%.2f, %.2f) %s, clamped %u frames",
+			     (double)(cur->m_nFrameIndex - context->dbg_window_frame_index) / elapsed,
+			     context->stab_tau * 1000.0, context->dbg_max_dx, context->dbg_max_dy, unit,
+			     context->dbg_clamped);
+		if (context->stab_full_lock && context->dbg_cal_n > 2) {
+			const int m = context->dbg_cal_n - 1;
+			const double mean = context->dbg_cal_sum / m;
+			const double var = context->dbg_cal_sum2 / m - mean * mean;
+			info("stab: calibration score %.3f (lower = stiller; sweep Mirror Lag to minimize)",
+			     sqrt(var > 0.0 ? var : 0.0));
+		}
+		context->dbg_cal_n = 0;
+		context->dbg_cal_sum = context->dbg_cal_sum2 = 0.0;
 		context->dbg_window_start = context->prev_pose_time;
 		context->dbg_window_frame_index = cur->m_nFrameIndex;
 		context->dbg_max_dx = context->dbg_max_dy = 0.0;
@@ -2856,29 +2910,23 @@ static bool stab_ui_modd(obs_properties_t *props, obs_property_t *property, obs_
 	bool custom = obs_data_get_int(settings, "stab_preset") == 0;
 	bool nomargin = obs_data_get_double(settings, "scale_factor") < 1.01;
 	bool pos = obs_data_get_bool(settings, "stab_pos_comp");
+	// Collapsed panel (UI v1): main = Strength + Level Horizon + the zoom
+	// warning; everything else behind Show Advanced. The investigation-era
+	// pairing controls have no UI at all - the machinery is always on, and
+	// their settings keys stay readable for scripts.
+	const bool adv = obs_data_get_bool(settings, "stab_advanced");
 	bool changed = set_vis(props, "stab_zoom_warning", on && nomargin);
 	changed |= set_vis(props, "stab_preset", on);
-	changed |= set_vis(props, "stab_filter", on);
 	changed |= set_vis(props, "stab_roll_lock", on);
-	changed |= set_vis(props, "stab_horizon_lock", on);
-	changed |= set_vis(props, "stab_full_lock", on);
-	changed |= set_vis(props, "stab_pos_comp", on);
-	changed |= set_vis(props, "stab_pos_depth", on && pos);
+	changed |= set_vis(props, "stab_advanced", on);
+	changed |= set_vis(props, "stab_filter", on && adv);
 	changed |= set_vis(props, "stab_smooth_ms", on && custom);
-	changed |= set_vis(props, "stab_pair_frames", on && !obs_data_get_bool(settings, "stab_pair_auto"));
-	changed |= set_vis(props, "stab_pair_auto", on);
-	const bool pair_auto = obs_data_get_bool(settings, "stab_pair_auto");
-	const bool lag_auto = obs_data_get_bool(settings, "stab_lag_auto");
-	changed |= set_vis(props, "stab_pair_lag_ms", on && pair_auto && !lag_auto);
-	changed |= set_vis(props, "stab_pair_phase", on && pair_auto);
-	changed |= set_vis(props, "stab_hold", on);
-	changed |= set_vis(props, "stab_lag_auto", on && pair_auto);
-	changed |= set_vis(props, "stab_lag_base_ms", on && pair_auto && lag_auto);
-	// The old integer Auto/Manual pose delay is superseded by the frame-based
-	// Pairing Offset; only the Tier-1 crop fallback still reads it, so hide it.
-	changed |= set_vis(props, "stab_pose_delay", false);
-	changed |= set_vis(props, "stab_debug", on);
-	changed |= set_vis(props, "stab_telemetry", on);
+	changed |= set_vis(props, "stab_pos_comp", on && adv);
+	changed |= set_vis(props, "stab_pos_depth", on && adv && pos);
+	changed |= set_vis(props, "stab_lag_base_ms", on && adv);
+	changed |= set_vis(props, "stab_full_lock", on && adv);
+	changed |= set_vis(props, "stab_debug", on && adv);
+	changed |= set_vis(props, "stab_telemetry", on && adv);
 
 	// One Euro only smooths at this rate while the head is at rest - rename
 	// the slider so the number isn't read as a fixed delay in that mode.
@@ -2961,13 +3009,20 @@ static obs_properties_t *win_openvr_properties(void *data)
 						    "Increase Zoom (1.2+) to hide them."),
 				    OBS_TEXT_INFO);
 	obs_property_text_set_info_type(p, OBS_TEXT_INFO_WARNING);
-	p = obs_properties_add_list(props, "stab_preset", obs_module_text("Stabilization Preset"), OBS_COMBO_TYPE_LIST,
+	p = obs_properties_add_list(props, "stab_preset", obs_module_text("Strength"), OBS_COMBO_TYPE_LIST,
 				    OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(p, obs_module_text("Low"), 1);
 	obs_property_list_add_int(p, obs_module_text("Medium"), 2);
 	obs_property_list_add_int(p, obs_module_text("High"), 3);
 	obs_property_list_add_int(p, obs_module_text("Custom"), 0);
 	obs_property_set_modified_callback(p, stab_ui_modd);
+	// Placed directly under Strength: choosing Custom reveals it in place, no
+	// trip through Advanced (the choice itself was the opt-in).
+	p = obs_properties_add_int_slider(props, "stab_smooth_ms", obs_module_text("Smoothing Time (ms)"), 50, 2000, 10);
+	obs_property_set_long_description(
+		p, obs_module_text("Time constant of the head-direction average the view is reprojected to. "
+				   "Higher = steadier output that trails further behind deliberate turns. "
+				   "Presets: Low 200, Medium 500, High 1000."));
 	p = obs_properties_add_list(props, "stab_filter", obs_module_text("Smoothing Filter"), OBS_COMBO_TYPE_LIST,
 				    OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(p, obs_module_text("Damped Average (constant smoothing)"), 0);
@@ -2978,22 +3033,21 @@ static obs_properties_t *win_openvr_properties(void *data)
 				   "suppresses shake equally at rest and in motion but trails deliberate turns. "
 				   "One Euro speeds up with head motion: far less trail, but fast movement also "
 				   "lets more shake through."));
-	p = obs_properties_add_bool(props, "stab_roll_lock", obs_module_text("Roll Lock (level horizon)"));
+	p = obs_properties_add_bool(props, "stab_roll_lock", obs_module_text("Roll Lock"));
 	obs_property_set_long_description(
-		p, obs_module_text("Keeps the horizon gravity-level instead of following smoothed head roll."));
-	p = obs_properties_add_bool(props, "stab_horizon_lock", obs_module_text("Horizon Lock (debug)"));
+		p, obs_module_text("Keeps the horizon gravity-level instead of following smoothed head roll - "
+				   "the viewer never sees the camera tilt."));
+	p = obs_properties_add_bool(props, "stab_advanced", obs_module_text("Show Advanced Settings"));
 	obs_property_set_long_description(
-		p, obs_module_text("Diagnostic: pins pitch AND roll to gravity (yaw still follows). Nod or "
-				   "shake the headset - if the horizon line still moves vertically, the "
-				   "correction gain or pose pairing is wrong, not the filter. Supersedes "
-				   "Roll Lock while enabled."));
-	p = obs_properties_add_bool(props, "stab_full_lock", obs_module_text("Full Lock (debug: freeze all axes)"));
+		p, obs_module_text("Filter choice, positional compensation, the Mirror Lag calibration, and "
+				   "diagnostics. The defaults are right for almost everyone."));
+	obs_property_set_modified_callback(p, stab_ui_modd);
+	p = obs_properties_add_bool(props, "stab_full_lock", obs_module_text("Calibration: Freeze View"));
 	obs_property_set_long_description(
-		p, obs_module_text("Diagnostic: freezes yaw, pitch AND roll to the heading captured when you "
-				   "enable it. Shake the headset in ANY direction - the image should stay rock "
-				   "still (until you exceed the Zoom margin or 45 deg). Any residual motion means "
-				   "the pose pairing or warp gain is off. Supersedes the other locks; turn off "
-				   "for normal use (it fights deliberate turning)."));
+		p, obs_module_text("Freezes the view to the heading captured when you enable it - for "
+				   "calibrating Mirror Lag. Shake the headset and sweep Mirror Lag until the "
+				   "image is dead still; a calibration score prints to the OBS log every 2 s "
+				   "(lower is better). Turn OFF for normal use - it fights deliberate turning."));
 	p = obs_properties_add_bool(props, "stab_pos_comp", obs_module_text("Positional Jitter Compensation (Experimental)"));
 	obs_property_set_long_description(
 		p, obs_module_text("Counteracts small positional shake (tremor, headset wobble) at an assumed "
@@ -3005,75 +3059,13 @@ static obs_properties_t *win_openvr_properties(void *data)
 				   "some parallax shake. 1.0-2.0 m suits close-range games; push toward 100 m "
 				   "(effectively infinite) for distant scenery / horizons - the positional "
 				   "correction shrinks with depth, so far content stops being pushed around."));
-	p = obs_properties_add_int_slider(props, "stab_smooth_ms", obs_module_text("Smoothing Time (ms)"), 50, 2000, 10);
-	obs_property_set_long_description(
-		p, obs_module_text("Time constant of the head-direction average the view is reprojected to. "
-				   "Higher = steadier output that trails further behind deliberate turns. "
-				   "Presets: Low 200, Medium 500, High 1000."));
-	p = obs_properties_add_int_slider(props, "stab_pose_delay", obs_module_text("Stabilization Pose Delay"), -1, 15,
-					  1);
-	obs_property_set_long_description(
-		p, obs_module_text("How many compositor frames back the pose lookup pairs with the mirror image. "
-				   "-1 = Auto (tracks the last presented frame, but only reaches 3). If the "
-				   "stabilized image visibly trails the mirror's own motion, the pairing is off: "
-				   "turn on Horizon Lock, shake the headset, and raise this until the horizon "
-				   "stops moving. That value is your true mirror latency (frames x frame time)."));
-	p = obs_properties_add_int_slider(props, "stab_pair_frames", obs_module_text("Pairing Offset (frames)"), 0, 4, 1);
-	obs_property_set_long_description(
-		p, obs_module_text("How many compositor frames the mirror lags the pose - the pose each frame is "
-				   "paired with. Frame-based, so it stays correct even when a heavy game makes the "
-				   "framerate jitter (a fixed millisecond offset does not). Turn on Full Lock, "
-				   "shake the headset, and adjust until the image is stillest (usually 1). "
-				   "Ignored when Mirror Lag pairing is enabled below."));
-	p = obs_properties_add_bool(props, "stab_pair_auto", obs_module_text("Pair by Mirror Lag (time, not frames)"));
-	obs_property_set_long_description(
-		p, obs_module_text("Picks the paired frame by how far the mirror lags in TIME rather than by a "
-				   "fixed frame count. The compositor runs on a fixed vsync grid but a frame "
-				   "spans one vsync when idle and two under game load, so one physical lag is a "
-				   "different frame count per load - which is why no single Pairing Offset works "
-				   "at both. This measures the frame times instead of assuming them."));
-	obs_property_set_modified_callback(p, stab_ui_modd);
-	p = obs_properties_add_float_slider(props, "stab_pair_lag_ms", obs_module_text("Mirror Lag (ms)"), -20.0, 40.0,
+	p = obs_properties_add_float_slider(props, "stab_lag_base_ms", obs_module_text("Mirror Lag (ms)"), -20.0, 40.0,
 					   0.5);
 	obs_property_set_long_description(
-		p, obs_module_text("How long after a frame is composited it becomes visible in the mirror. "
-				   "Nothing in the API reports this, so it has to be dialled in: turn on Full "
-				   "Lock, shake the headset, and sweep until the image is stillest. NEGATIVE "
-				   "values lead instead of lag - the pose is extrapolated forward to where the "
-				   "head will be when the GPU actually samples the mirror. Use those if the "
-				   "stabilization visibly TRAILS the image even at 0."));
-	p = obs_properties_add_bool(props, "stab_pair_phase", obs_module_text("Sub-frame Phase Correction"));
-	obs_property_set_long_description(
-		p, obs_module_text("Measures how far into a compositor frame's life we sampled, instead of "
-				   "assuming we looked right at its start. When the game runs at full rate the "
-				   "capture ends up locked onto the frame boundary, so tiny timing jitter flips "
-				   "which frame is picked - every frame a coin toss. This measures the offset and "
-				   "picks correctly. Most useful in light-load games; harmless in heavy ones."));
-	p = obs_properties_add_bool(props, "stab_hold", obs_module_text("Hold One Frame (measured, not predicted)"));
-	obs_property_set_long_description(
-		p, obs_module_text("Delays the output by a single frame so the headset pose that matches it has "
-				   "already arrived, instead of guessing where the head will be. Removes the "
-				   "overshoot you get on direction changes when the pose is extrapolated. Costs "
-				   "one frame of latency and a copy of the mirror - irrelevant for recording. "
-				   "With this on, Mirror Lag shifts WHICH already-captured frame gets paired, and "
-				   "the right value is usually NEGATIVE: the mirror already held an older frame at "
-				   "the moment we copied it. Sweep both sides of zero."));
-	p = obs_properties_add_bool(props, "stab_lag_auto", obs_module_text("Auto Mirror Lag (detect reprojection)"));
-	obs_property_set_long_description(
-		p, obs_module_text("Detects whether the game runs at the headset's full rate or is being "
-				   "reprojected (frames spanning two or more vsyncs) and shifts the lag by "
-				   "exactly that many vsync periods. Uses its own Native Mirror Lag value "
-				   "below - your manual Mirror Lag is untouched. A cadence change must hold "
-				   "for ~2 s before the mode flips, so brief loading-screen bursts are ridden "
-				   "out instead of flapped through. Best for games that hold full or half "
-				   "rate; content wandering between (70-90 fps) is better served manually."));
-	obs_property_set_modified_callback(p, stab_ui_modd);
-	p = obs_properties_add_float_slider(props, "stab_lag_base_ms", obs_module_text("Native Mirror Lag (ms)"),
-					   -20.0, 40.0, 0.5);
-	obs_property_set_long_description(
-		p, obs_module_text("The lag calibrated in an EMPTY SteamVR (native full-rate pipeline; +8.5 on "
-				   "this rig). The reprojected value is derived by subtracting the measured "
-				   "frame span, so this one number covers every load and refresh rate."));
+		p, obs_module_text("The one calibration: how long after a frame is composited its pixels reach "
+				   "the mirror on THIS rig (+8.5 here). Auto-adjusted per load and refresh - "
+				   "reprojected games derive their value from this one. To calibrate: check "
+				   "Calibration: Freeze View, shake the headset, sweep until dead still."));
 	p = obs_properties_add_bool(props, "stab_debug", obs_module_text("Stabilization: Debug Logging"));
 	p = obs_properties_add_bool(props, "stab_telemetry", obs_module_text("Stabilization: Record Telemetry (CSV)"));
 	obs_property_set_long_description(
