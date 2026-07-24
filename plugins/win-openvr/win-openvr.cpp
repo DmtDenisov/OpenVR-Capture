@@ -316,6 +316,7 @@ float4 PSMain(VSOut i) : SV_Target
 // tangent units (~4.5 degrees).
 #define STAB_BLEND_BAND 0.08f
 
+
 // Auto pose-delay vote window, in compositor frames (~1.3 s at 90 fps).
 #define STAB_AUTO_WIN 120
 
@@ -499,6 +500,8 @@ struct win_openvr {
 	// Filter state
 	bool stab_has_state;
 	quatd q_smooth;
+	double stab_knee_u;  // telemetry: correction target / feasibility ceiling (999 = degenerate)
+	double stab_lim_deg; // telemetry: withheld fold deg this frame (negative = snapped)
 	quatd q_prev_raw; // One Euro speed estimate
 	double omega_lp;  // One Euro speed estimate, low-passed (rad/s)
 	double prev_pose_time;
@@ -2503,7 +2506,7 @@ static void stab_telemetry_write(win_openvr *context, const vr::Compositor_Frame
 			"presents,dropped,mispres,flags,"
 			"predicted,vs_ready,vs_view,crender_start_ms,crender_gpu_ms,crender_cpu_ms,"
 			"newframe_ready_ms,transfer_ms,frozen,clamped,qa_w,qa_x,qa_y,qa_z,qs_w,qs_x,qs_y,qs_z,"
-			"pa_x,pa_y,pa_z,ps_x,ps_y,ps_z,corr_deg,posc_x,posc_y,posc_z\n");
+			"pa_x,pa_y,pa_z,ps_x,ps_y,ps_z,corr_deg,posc_x,posc_y,posc_z,knee_u,lim_deg\n");
 		context->stab_telemetry_lines = 0;
 	}
 	const quatd &qa = context->stab_q_ref;
@@ -2511,7 +2514,7 @@ static void stab_telemetry_write(win_openvr *context, const vr::Compositor_Frame
 	fprintf(context->stab_telemetry_file,
 		"%.6f,%u,%d,%u,%.4f,%.4f,%.4f,%d,%d,%.4f,%d,%d,%.4f,%llu,%d,%d,%.4f,%u,%u,%u,0x%X,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,"
 		"%d,%d,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,"
-		"%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.4f,%.6f,%.6f,%.6f\n",
+		"%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.4f,%.6f,%.6f,%.6f,%.4f,%.4f\n",
 		context->prev_pose_time, cur->m_nFrameIndex, pose_delay, pr.dframe, pr.phase_ms, pr.extrap_ms,
 		pr.eff_lag_ms, pr.lag_mode, pr.cap_used, pr.cap_phase_ms, pr.pair_future, pr.vsync_ok,
 		pr.vsync_phase_ms, (unsigned long long)pr.vsync_counter,
@@ -2521,7 +2524,7 @@ static void stab_telemetry_write(win_openvr *context, const vr::Compositor_Frame
 		frozen ? 1 : 0, clamped ? 1 : 0, qa.w, qa.x,
 		qa.y, qa.z, qs.w, qs.x, qs.y, qs.z, context->stab_p_raw.x, context->stab_p_raw.y, context->stab_p_raw.z,
 		context->p_smooth.x, context->p_smooth.y, context->p_smooth.z, corr_deg, posc_eye.x, posc_eye.y,
-		posc_eye.z);
+		posc_eye.z, context->stab_knee_u, context->stab_lim_deg);
 	if (++context->stab_telemetry_lines % 90 == 0)
 		fflush(context->stab_telemetry_file);
 }
@@ -2711,6 +2714,13 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 	// the pose the displayed frame was rendered with; the rotational excess
 	// folds back into q_smooth so the correction rides the largest feasible
 	// fraction (the positional state is self-bounded at 2 cm).
+	// NOTE: a soft-knee + rate-limited-fold variant shipped briefly and was
+	// REVERTED on user verdict (2026-07-25, runs 44-46): any pre-ceiling give
+	// reads as lost smoothness on this use-case. Do not re-add softening
+	// without new evidence. knee_u/lim_deg telemetry columns remain for CSV
+	// format stability and always log 0.
+	context->stab_knee_u = 0.0;
+	context->stab_lim_deg = 0.0;
 	if (corrected && !context->stab_black_edges && !stab_corners_feasible(context, q_err, posc_h)) {
 		const quatd q_target = context->q_smooth;
 		const vec3d posc_full = posc_h;
@@ -2913,7 +2923,8 @@ static bool stab_ui_modd(obs_properties_t *props, obs_property_t *property, obs_
 	// Collapsed panel (UI v1): main = Strength + Level Horizon + the zoom
 	// warning; everything else behind Show Advanced. The investigation-era
 	// pairing controls have no UI at all - the machinery is always on, and
-	// their settings keys stay readable for scripts.
+	// their settings keys stay readable for scripts. Exception: Hold One
+	// Frame is back under Advanced as the capture-cost A/B switch.
 	const bool adv = obs_data_get_bool(settings, "stab_advanced");
 	bool changed = set_vis(props, "stab_zoom_warning", on && nomargin);
 	changed |= set_vis(props, "stab_preset", on);
@@ -2925,6 +2936,7 @@ static bool stab_ui_modd(obs_properties_t *props, obs_property_t *property, obs_
 	changed |= set_vis(props, "stab_pos_depth", on && adv && pos);
 	changed |= set_vis(props, "stab_lag_base_ms", on && adv);
 	changed |= set_vis(props, "stab_full_lock", on && adv);
+	changed |= set_vis(props, "stab_hold", on && adv);
 	changed |= set_vis(props, "stab_debug", on && adv);
 	changed |= set_vis(props, "stab_telemetry", on && adv);
 
@@ -3059,13 +3071,24 @@ static obs_properties_t *win_openvr_properties(void *data)
 				   "some parallax shake. 1.0-2.0 m suits close-range games; push toward 100 m "
 				   "(effectively infinite) for distant scenery / horizons - the positional "
 				   "correction shrinks with depth, so far content stops being pushed around."));
+	// 0.01 ms steps: validating the lag-equals-one-vsync model needs values
+	// like 8.33/12.50 exactly; type into the number field rather than drag.
 	p = obs_properties_add_float_slider(props, "stab_lag_base_ms", obs_module_text("Mirror Lag (ms)"), -20.0, 40.0,
-					   0.5);
+					   0.01);
 	obs_property_set_long_description(
 		p, obs_module_text("The one calibration: how long after a frame is composited its pixels reach "
 				   "the mirror on THIS rig (+8.5 here). Auto-adjusted per load and refresh - "
 				   "reprojected games derive their value from this one. To calibrate: check "
 				   "Calibration: Freeze View, shake the headset, sweep until dead still."));
+	// Restored after the UI collapse for the capture-cost A/B: OFF idles the
+	// boundary-locked capture (no per-record mirror copies) and warps the live
+	// mirror with extrapolated pairing - v2.1 behavior. Default stays ON.
+	p = obs_properties_add_bool(props, "stab_hold", obs_module_text("Hold One Frame"));
+	obs_property_set_long_description(
+		p, obs_module_text("Warp the previous frame's captured pixels so the pose is measured, not "
+				   "predicted. Leave ON - OFF reverts to live-mirror pairing with predicted "
+				   "poses, which overshoots when head motion changes direction. Uncheck only "
+				   "to test whether the capture copies cost game performance."));
 	p = obs_properties_add_bool(props, "stab_debug", obs_module_text("Stabilization: Debug Logging"));
 	p = obs_properties_add_bool(props, "stab_telemetry", obs_module_text("Stabilization: Record Telemetry (CSV)"));
 	obs_property_set_long_description(
