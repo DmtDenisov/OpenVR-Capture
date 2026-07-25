@@ -388,6 +388,9 @@ struct win_openvr {
 	bool stab_telemetry;
 	FILE *stab_telemetry_file;
 	uint32_t stab_telemetry_lines;
+	FILE *stab_probe_file; // pose-source probe CSV; poller thread owns it exclusively
+	uint32_t stab_probe_lines;
+	int64_t stab_probe_qpc0;
 
 	quatd stab_q_ref; // raw pose of the displayed frame (telemetry)
 
@@ -441,6 +444,20 @@ struct win_openvr {
 	volatile LONG stab_poll_pos;
 	uint32_t stab_poll_idx[16];
 	int64_t stab_poll_qpc[16];
+	// Pose ring beside the stamp ring (PSVR2-class drivers ship records with
+	// bPoseIsValid=false). GetLastPoses sampled at boundary i carries the
+	// pose of record i+1 EXACTLY (probe 49: residual p50 0.0000 deg at a
+	// +1.00-record shift vs the embedded pose). Writer: payload stores, then
+	// pok published via InterlockedExchange. READERS DO NOT GO THROUGH
+	// stab_poll_pos - they scan slots by index match and must re-verify
+	// idx+pok AFTER loading the payload (seqlock-lite) because the writer
+	// recycles the oldest slot underneath them.
+	quatd stab_poll_pq[16];  // GetLastPoses render pose (quat) per boundary
+	vec3d stab_poll_pp[16];  // and its position
+	LONG stab_poll_pok[16];  // pose valid + tracking OK + stamped on time
+	bool stab_synth_logged;   // one-shot log when synthesis first engages
+	bool stab_synth_t0_warned; // one-shot warn: synthesized record had no timestamp
+	bool stab_probe_failed;    // probe fopen failed - stop retrying at boundary rate
 	int64_t stab_qpc_freq;
 
 	// Boundary-locked capture: the poller copies the mirror at MID-SLOT
@@ -1263,7 +1280,10 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 	context->stab_pos_comp = stab_pos_comp;
 	context->stab_pos_depth = std::min(std::max(obs_data_get_double(settings, "stab_pos_depth"), 0.3), 100.0);
 
-	int stab_pose_delay = std::min(std::max((int)obs_data_get_int(settings, "stab_pose_delay"), -1), 15);
+	// Max 14, not 15: the pose-synthesis ring is 16 slots deep and delay 15
+	// asks for index n-16 - permanently one past the ring on PSVR2-class
+	// drivers (panel). Auto mode caps at 3; only hand-set configs get here.
+	int stab_pose_delay = std::min(std::max((int)obs_data_get_int(settings, "stab_pose_delay"), -1), 14);
 	if (stab_pose_delay != context->stab_pose_delay) {
 		context->stab_auto_pos = 0;
 		context->stab_auto_cnt = 0; // restart the vote window
@@ -1807,6 +1827,80 @@ static void stab_cap_execute(win_openvr *context, int64_t due)
 	InterlockedExchange(&context->cap_valid[slot], 1);
 }
 
+// Pose-source probe (PSVR2 groundwork). Probe 48 (superseding run 42's
+// misread): Sony's PC driver ships records whose TIMESTAMPS tick normally -
+// only m_HmdPose.bPoseIsValid is false on every record. GetLastPoses proved
+// to be the record pose shifted exactly +1 record (probe 49, Quest ground
+// truth) and drives the synthesis fallback; this probe stays to validate new
+// drivers. Snapshots all three pose surfaces at each boundary while telemetry
+// AND stabilization are on. Poller thread owns the file exclusively.
+static void stab_probe_write(win_openvr *context, int64_t qpc, const vr::Compositor_FrameTiming *t)
+{
+	if (!context->stab_telemetry || !context->stabilize) {
+		if (context->stab_probe_file) {
+			fclose(context->stab_probe_file);
+			context->stab_probe_file = nullptr;
+		}
+		return;
+	}
+	if (context->stab_probe_failed)
+		return; // do not retry fopen at boundary rate
+	if (!context->stab_probe_file) {
+		const char *appdata = getenv("APPDATA");
+		if (!appdata) {
+			context->stab_probe_failed = true;
+			return;
+		}
+		char path[512];
+		snprintf(path, sizeof(path), "%s\\obs-studio\\logs\\stab-probe.csv", appdata);
+		// Append: every re-init restarts the poller, and "w" would truncate
+		// a possibly hours-long capture from a hard-to-reproduce session.
+		context->stab_probe_file = fopen(path, "a");
+		if (!context->stab_probe_file) {
+			context->stab_probe_failed = true;
+			warn("stab: could not open pose probe file %s", path);
+			return;
+		}
+		// Big buffer + rare flushes: this runs on the 1 kHz poller thread,
+		// and blocking I/O here perturbs the very timing being measured.
+		setvbuf(context->stab_probe_file, nullptr, _IOFBF, 1 << 16);
+		info("stab: probing pose sources to %s", path);
+		fseek(context->stab_probe_file, 0, SEEK_END);
+		if (ftell(context->stab_probe_file) == 0)
+			fprintf(context->stab_probe_file,
+			"t_ms,idx,rec_time_s,rec_valid,rec_qw,rec_qx,rec_qy,rec_qz,rec_px,rec_py,rec_pz,"
+			"lp_err,lp_valid,lp_qw,lp_qx,lp_qy,lp_qz,lp_px,lp_py,lp_pz,lpg_valid,"
+			"gd_valid,gd_qw,gd_qx,gd_qy,gd_qz,gd_px,gd_py,gd_pz\n");
+		context->stab_probe_qpc0 = qpc;
+		context->stab_probe_lines = 0;
+	}
+	const double t_ms = (double)(qpc - context->stab_probe_qpc0) * 1000.0 / (double)context->stab_qpc_freq;
+	const quatd rq = quat_from_hmd34(t->m_HmdPose.mDeviceToAbsoluteTracking);
+	const vr::HmdMatrix34_t &rm = t->m_HmdPose.mDeviceToAbsoluteTracking;
+	vr::TrackedDevicePose_t lpr[1] = {}, lpg[1] = {}, gd[1] = {};
+	vr::EVRCompositorError lperr = vr::VRCompositorError_None;
+	if (vr::VRCompositor())
+		lperr = vr::VRCompositor()->GetLastPoses(lpr, 1, lpg, 1);
+	if (vr::VRSystem() && vr::VRCompositor())
+		vr::VRSystem()->GetDeviceToAbsoluteTrackingPose(vr::VRCompositor()->GetTrackingSpace(), 0.0f, gd, 1);
+	const quatd lq = quat_from_hmd34(lpr[0].mDeviceToAbsoluteTracking);
+	const vr::HmdMatrix34_t &lm = lpr[0].mDeviceToAbsoluteTracking;
+	const quatd gq = quat_from_hmd34(gd[0].mDeviceToAbsoluteTracking);
+	const vr::HmdMatrix34_t &gm = gd[0].mDeviceToAbsoluteTracking;
+	fprintf(context->stab_probe_file,
+		"%.3f,%u,%.6f,%d,%.8f,%.8f,%.8f,%.8f,%.5f,%.5f,%.5f,"
+		"%d,%d,%.8f,%.8f,%.8f,%.8f,%.5f,%.5f,%.5f,%d,"
+		"%d,%.8f,%.8f,%.8f,%.8f,%.5f,%.5f,%.5f\n",
+		t_ms, t->m_nFrameIndex, t->m_flSystemTimeInSeconds, t->m_HmdPose.bPoseIsValid ? 1 : 0,
+		rq.w, rq.x, rq.y, rq.z, rm.m[0][3], rm.m[1][3], rm.m[2][3],
+		(int)lperr, lpr[0].bPoseIsValid ? 1 : 0,
+		lq.w, lq.x, lq.y, lq.z, lm.m[0][3], lm.m[1][3], lm.m[2][3], lpg[0].bPoseIsValid ? 1 : 0,
+		gd[0].bPoseIsValid ? 1 : 0,
+		gq.w, gq.x, gq.y, gq.z, gm.m[0][3], gm.m[1][3], gm.m[2][3]);
+	if (++context->stab_probe_lines % 900 == 0)
+		fflush(context->stab_probe_file); // ~every 8 s; fclose flushes the tail
+}
+
 // Poller: watch the compositor's frame index far faster than we render, and
 // stamp QPC at every boundary. GetFrameTiming is a read out of the runtime's
 // shared memory, so this is cheap; it never touches D3D or the mirror SRV.
@@ -1849,10 +1943,36 @@ static DWORD WINAPI stab_poll_proc(LPVOID param)
 				const int slot = (int)((context->stab_poll_pos + 1) & 15);
 				context->stab_poll_idx[slot] = t.m_nFrameIndex;
 				context->stab_poll_qpc[slot] = wake.QuadPart;
+				// Pose ring: GetLastPoses here carries the pose of record
+				// m_nFrameIndex+1 (probe-proven exact). Cheap shared-mem
+				// read at boundary rate; must precede the pos publish.
+				// Lateness guard mirrors the capture scheduler: a stamp
+				// taken >3 ms into the record (or the session's first,
+				// unanchored stamp) may already see record i+2's pose -
+				// leave pok=0 and let the fetch fall back to a neighbor.
+				{
+					vr::TrackedDevicePose_t lp[1] = {};
+					context->stab_poll_pok[slot] = 0;
+					if (have && this_gap_ms <= 3.0 &&
+					    vr::VRCompositor()->GetLastPoses(lp, 1, nullptr, 0) ==
+						    vr::VRCompositorError_None &&
+					    lp[0].bPoseIsValid &&
+					    lp[0].eTrackingResult == vr::TrackingResult_Running_OK) {
+						const vr::HmdMatrix34_t &m = lp[0].mDeviceToAbsoluteTracking;
+						context->stab_poll_pq[slot] =
+							quat_normalize(quat_from_hmd34(m));
+						context->stab_poll_pp[slot] = {m.m[0][3], m.m[1][3],
+									       m.m[2][3]};
+						// Interlocked: MSVC may not hoist this above
+						// the payload stores (plain store could).
+						InterlockedExchange(&context->stab_poll_pok[slot], 1);
+					}
+				}
 				// publish last: readers key off pos
 				InterlockedExchange(&context->stab_poll_pos, slot);
 				last = t.m_nFrameIndex;
 				have = true;
+				stab_probe_write(context, wake.QuadPart, &t);
 				// Schedule this record's mid-slot capture. A wake that was
 				// itself late (>3 ms gap) detected this boundary late too -
 				// its stamp is already suspect, so sit this record out
@@ -1892,6 +2012,12 @@ static void stab_poll_start(win_openvr *context)
 	// and stale stamps from the dead session would otherwise win QPC lookups.
 	memset((void *)context->stab_poll_idx, 0, sizeof(context->stab_poll_idx));
 	memset((void *)context->stab_poll_qpc, 0, sizeof(context->stab_poll_qpc));
+	memset((void *)context->stab_poll_pq, 0, sizeof(context->stab_poll_pq));
+	memset((void *)context->stab_poll_pp, 0, sizeof(context->stab_poll_pp));
+	memset((void *)context->stab_poll_pok, 0, sizeof(context->stab_poll_pok));
+	context->stab_synth_logged = false; // re-log per session, like the ring reset
+	context->stab_synth_t0_warned = false;
+	context->stab_probe_failed = false;
 	InterlockedExchange(&context->stab_poll_run, 1);
 	context->stab_poll_thread = CreateThread(nullptr, 0, stab_poll_proc, context, 0, nullptr);
 	if (!context->stab_poll_thread)
@@ -1910,6 +2036,11 @@ static void stab_poll_stop(win_openvr *context)
 	WaitForSingleObject(context->stab_poll_thread, INFINITE);
 	CloseHandle(context->stab_poll_thread);
 	context->stab_poll_thread = nullptr;
+	// Safe only after the join: the poller thread owned this file.
+	if (context->stab_probe_file) {
+		fclose(context->stab_probe_file);
+		context->stab_probe_file = nullptr;
+	}
 }
 
 // Seconds since the record with this frame index began, measured. Returns <0 if
@@ -2028,19 +2159,21 @@ static void stab_hold_capture(win_openvr *context, ID3D11DeviceContext *ctx,
 }
 
 // Fetch the raw pose + reprojection flag matching the current mirror frame.
-static bool stab_fetch_pose(const vr::Compositor_FrameTiming *cur, int pose_delay, quatd *q_out, vec3d *p_out,
-			    double *t_out, bool *frozen_out, StabPairInfo *info_out)
+static bool stab_fetch_pose(win_openvr *context, const vr::Compositor_FrameTiming *cur, int pose_delay,
+			    quatd *q_out, vec3d *p_out, double *t_out, bool *frozen_out, StabPairInfo *info_out)
 {
 	// The newest timing entry is the frame the compositor just started; the
 	// mirror shows an older, already-composited frame. Track WHICH record we
-	// settled on - on a failed fetch or invalid pose we fall back to cur, which
-	// silently collapses the offset to zero.
+	// settled on - on a failed FETCH we fall back to cur, which silently
+	// collapses the offset to zero. An invalid EMBEDDED pose no longer
+	// rejects the record: PSVR2-class drivers ship EVERY record with
+	// bPoseIsValid=false while the timestamps tick normally (probe 48), so
+	// the pose is synthesized from the poller's GetLastPoses ring instead.
 	const vr::Compositor_FrameTiming *used = cur;
 	vr::Compositor_FrameTiming past = {};
 	if (pose_delay > 0) {
 		past.m_nSize = sizeof(vr::Compositor_FrameTiming);
-		if (vr::VRCompositor()->GetFrameTiming(&past, (uint32_t)pose_delay) &&
-		    past.m_HmdPose.bPoseIsValid)
+		if (vr::VRCompositor()->GetFrameTiming(&past, (uint32_t)pose_delay))
 			used = &past;
 	}
 	const vr::TrackedDevicePose_t *pose = &used->m_HmdPose;
@@ -2063,12 +2196,69 @@ static bool stab_fetch_pose(const vr::Compositor_FrameTiming *cur, int pose_dela
 		info_out->transfer_ms = used->m_flTransferLatencyMs;
 	}
 
-	if (!pose->bPoseIsValid || pose->eTrackingResult != vr::TrackingResult_Running_OK)
-		return false;
-
-	*q_out = quat_normalize(quat_from_hmd34(pose->mDeviceToAbsoluteTracking));
-	const vr::HmdMatrix34_t &hm = pose->mDeviceToAbsoluteTracking;
-	*p_out = {hm.m[0][3], hm.m[1][3], hm.m[2][3]};
+	if (pose->bPoseIsValid && pose->eTrackingResult == vr::TrackingResult_Running_OK) {
+		*q_out = quat_normalize(quat_from_hmd34(pose->mDeviceToAbsoluteTracking));
+		const vr::HmdMatrix34_t &hm = pose->mDeviceToAbsoluteTracking;
+		*p_out = {hm.m[0][3], hm.m[1][3], hm.m[2][3]};
+	} else {
+		// Pose synthesis: the ring slot stamped with index i holds the
+		// GetLastPoses pose of record i+1 (probe 49: exact, p50 residual
+		// 0.0000 deg), so record k's pose lives at idx == k-1. A skipped
+		// boundary (late poller wake) leaves k-1 unstamped: accept k-2's
+		// slot then - one record (~8.3 ms) stale beats an unwarped pop.
+		// Seqlock-lite: load the payload FIRST, then re-verify idx+pok -
+		// the writer recycles the oldest slot underneath scanners, and a
+		// fully rewritten quat is unit-norm so a norm check alone cannot
+		// catch it.
+		const uint32_t wantidx = used->m_nFrameIndex - 1;
+		bool synth_ok = false;
+		quatd q = {1.0, 0.0, 0.0, 0.0};
+		vec3d p = {0.0, 0.0, 0.0};
+		for (int back = 0; back < 2 && !synth_ok; back++) {
+			const uint32_t idx = wantidx - (uint32_t)back;
+			for (int i = 0; i < 16; i++) {
+				if (context->stab_poll_idx[i] != idx ||
+				    !InterlockedCompareExchange(&context->stab_poll_pok[i], 1, 1))
+					continue;
+				q = context->stab_poll_pq[i];
+				p = context->stab_poll_pp[i];
+				const double n2 = quat_dot(q, q);
+				if (context->stab_poll_idx[i] == idx &&
+				    InterlockedCompareExchange(&context->stab_poll_pok[i], 1, 1) &&
+				    n2 > 0.998 && n2 < 1.002)
+					synth_ok = true;
+				break;
+			}
+		}
+		if (!synth_ok) {
+			// Quest-class blip (embedded poses normally valid): restore
+			// the pre-synthesis behavior - collapse to cur's valid pose
+			// rather than popping the correction. On PSVR2 cur's pose is
+			// invalid too, so this never masks a real ring miss there.
+			if (cur->m_HmdPose.bPoseIsValid &&
+			    cur->m_HmdPose.eTrackingResult == vr::TrackingResult_Running_OK) {
+				const vr::HmdMatrix34_t &cm = cur->m_HmdPose.mDeviceToAbsoluteTracking;
+				*q_out = quat_normalize(quat_from_hmd34(cm));
+				*p_out = {cm.m[0][3], cm.m[1][3], cm.m[2][3]};
+				*t_out = cur->m_flSystemTimeInSeconds;
+				*frozen_out = (cur->m_nReprojectionFlags &
+					       vr::VRCompositor_ReprojectionMotion) != 0;
+				return true;
+			}
+			return false;
+		}
+		if (!context->stab_synth_logged) {
+			context->stab_synth_logged = true;
+			info("stab: record pose invalid - synthesizing from GetLastPoses (PSVR2-class driver)");
+		}
+		if (used->m_flSystemTimeInSeconds <= 0.0 && !context->stab_synth_t0_warned) {
+			context->stab_synth_t0_warned = true;
+			warn("stab: synthesized record carries no timestamp - pairing cannot anchor "
+			     "(this driver ships neither pose nor time in its records)");
+		}
+		*q_out = q;
+		*p_out = p;
+	}
 	*t_out = used->m_flSystemTimeInSeconds;
 	*frozen_out = (used->m_nReprojectionFlags & vr::VRCompositor_ReprojectionMotion) != 0;
 	return true;
@@ -2246,8 +2436,10 @@ static bool stab_update_filter(win_openvr *context, const vr::Compositor_FrameTi
 	vec3d p;
 	double t;
 	bool frozen;
-	if (!stab_fetch_pose(cur, pose_delay, &q, &p, &t, &frozen, nullptr)) {
-		context->stab_has_state = false;
+	if (!stab_fetch_pose(context, cur, pose_delay, &q, &p, &t, &frozen, nullptr)) {
+		// Keep the filter state: the last crop simply persists this frame.
+		// Clearing state here forced a reseed - a visible crop jump - on
+		// every transient miss (panel, PSVR2 synthesis review).
 		return false;
 	}
 	*q_a_out = q;
@@ -2649,7 +2841,7 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 		context->stab_last_sel = sel;
 		context->stab_has_sel = true;
 
-		bool have = stab_fetch_pose(cur, want, &q_a, &p_a, &t_a, &frozen, &pair);
+		bool have = stab_fetch_pose(context, cur, want, &q_a, &p_a, &t_a, &frozen, &pair);
 
 		// Compositor drops emit adjacent records with equal or slightly
 		// REGRESSED timestamps (measured: 0 to -45 us, always dropped=1). The
@@ -2700,9 +2892,18 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 		pair.vsync_counter = vsync_frame;
 		const double ph = stab_phase_of(context, cur->m_nFrameIndex);
 		pair.phase_ms = ph >= 0.0 ? ph * 1000.0 : -1.0;
-		if (!have)
-			context->stab_has_state = false;
-		else if (stab_filter_core(context, cur, q_a, p_a, t_a)) {
+		if (!have) {
+			// Fetch/ring miss: hold LAST frame's correction instead of
+			// popping to unwarped (the cardinal invariant), and reanchor
+			// so the next success glides. Filter state is kept - a
+			// one-frame hold is the codebase's own "consistent repeat"
+			// rule. Only a cold start renders uncorrected.
+			if (context->stab_has_state) {
+				q_err = context->q_err_last;
+				posc_h = context->stab_posc_last;
+				context->stab_time_reanchor = true;
+			}
+		} else if (stab_filter_core(context, cur, q_a, p_a, t_a)) {
 			q_a_eff = q_a;
 			q_err = quat_mul(quat_conj(q_a), context->q_smooth);
 			posc_h = context->stab_posc;
