@@ -244,7 +244,7 @@ cbuffer StabParams : register(b0)
 	float4 crop;  // crop rect in canvas uv: u0, v0, du, dv
 	float4 misc;  // x: re-encode srgb, y: wide mode, z: blend band (tangent units),
 		      // w: +1 A's nasal edge is its left, -1 it's its right
-	float4 poscA; // xyz: positional correction / reference depth (eye A space)
+	float4 poscA; // xyz: positional correction / reference depth (eye A space); w: Panini d
 	float4 poscB; // xyz: same, eye B space
 	float4x4 RdA; // eye A <- smoothed rotation
 	float4x4 RdB; // eye B <- smoothed rotation
@@ -279,9 +279,28 @@ float4 PSMain(VSOut i) : SV_Target
 	float2 uvV = crop.xy + i.uv * crop.zw;
 	float tx = frC.x + uvV.x * (frC.y - frC.x);
 	float ty = frC.w - uvV.y * (frC.w - frC.z);
-	float3 ray = float3(tx, ty, -1.0);
+	float3 ray;
+	float pscale = 1.0;
+	float pd = poscA.w;
+	if (pd > 1e-4) {
+		// Inverse cylindrical Panini (straight verticals). d = 0 reduces to
+		// exactly the rectilinear ray below; raising d widens the view and
+		// compresses the horizontal periphery - the action-cam look.
+		float P = tx / (pd + 1.0);
+		float P2 = P * P;
+		float cphi = (-P2 * pd + sqrt(P2 * (1.0 - pd * pd) + 1.0)) / (P2 + 1.0);
+		float sphi = P * (pd + cphi);
+		float tv = ty * (pd + cphi) / (pd + 1.0);
+		ray = float3(sphi, tv, -cphi);
+		// The Panini ray's z-magnitude is cphi (<= 1), not 1: scale the
+		// positional term to match, else it amplifies by 1/cphi toward the
+		// periphery and steps discontinuously the moment d leaves 0.
+		pscale = cphi;
+	} else {
+		ray = float3(tx, ty, -1.0);
+	}
 
-	float3 dA = mul((float3x3)RdA, ray) - poscA.xyz;
+	float3 dA = mul((float3x3)RdA, ray) - poscA.xyz * pscale;
 	float2 tA = dA.xy / max(-dA.z, 1e-6);
 	float2 uvA = float2((tA.x - frA.x) / (frA.y - frA.x), (frA.w - tA.y) / (frA.w - frA.z));
 
@@ -289,7 +308,7 @@ float4 PSMain(VSOut i) : SV_Target
 	if (misc.y < 0.5) {
 		c = imgA.Sample(smp, uvA);
 	} else {
-		float3 dB = mul((float3x3)RdB, ray) - poscB.xyz;
+		float3 dB = mul((float3x3)RdB, ray) - poscB.xyz * pscale;
 		float2 tB = dB.xy / max(-dB.z, 1e-6);
 		float2 uvB = float2((tB.x - frB.x) / (frB.y - frB.x), (frB.w - tB.y) / (frB.w - frB.z));
 
@@ -383,6 +402,8 @@ struct win_openvr {
 	bool stab_lock_captured;
 	bool stab_pos_comp;
 	double stab_pos_depth;
+	double stab_tilt_deg; // camera pitch relative to the STABILIZED view (+up), shader path only
+	double stab_panini;   // Panini projection d, 0 = rectilinear (shader path only)
 	int stab_pose_delay;
 	bool stab_debug;
 	bool stab_telemetry;
@@ -426,6 +447,10 @@ struct win_openvr {
 	int stab_lag_dwell;      // ticks the candidate cadence has persisted
 	int stab_flag_recent;    // armed flag horizon, records (150 -> 0; armed on corroborated flags only)
 	int stab_flag_streak;    // corroboration window: records since the last flagged record (30 -> 0)
+	int stab_mixed_ticks;    // mixed-span detector: warp ticks with spans parked mid-band
+	double stab_flip_t[4];   // last 4 accepted classifier flip times (pose clock)
+	int stab_flip_pos;
+	bool stab_mixed_warned;  // one-shot log warn per session
 	double stab_vsync_s;     // cached 1/Prop_DisplayFrequency_Float, 0 = unknown
 	int stab_vsync_wait;     // probe backoff after a failed query
 	bool stab_vsync_warned;
@@ -643,6 +668,7 @@ static void destroy_obs_texture(gs_texture_t **texture) {
 static void stab_poll_start(win_openvr *context);
 static void stab_poll_stop(win_openvr *context);
 static double stab_phase_of(win_openvr *context, uint32_t frame_index);
+static bool stab_cadence_trouble(win_openvr *context);
 
 // Stack-only RAII for the GPU lock (the context struct stays POD; SRWLOCK's
 // zero state is valid, so bzalloc initializes it). Defined before
@@ -916,6 +942,9 @@ static void win_openvr_init(void *data, bool forced = true)
 				context->stab_has_state = false;
 				context->stab_flag_recent = 0; // fresh session, fresh flag horizon
 				context->stab_flag_streak = 0;
+				context->stab_mixed_ticks = 0;
+				context->stab_flip_pos = 0;
+				context->stab_mixed_warned = false;
 				context->stab_lock_captured = false; // full-lock re-captures on re-init
 				if (context->stabilize && (context->width == base_w ||
 							   context->height == base_h)) {
@@ -1283,6 +1312,26 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 		context->stab_has_state = false; // reseed the position state cleanly
 	context->stab_pos_comp = stab_pos_comp;
 	context->stab_pos_depth = std::min(std::max(obs_data_get_double(settings, "stab_pos_depth"), 0.3), 100.0);
+	const double new_tilt = std::min(std::max(obs_data_get_double(settings, "stab_tilt_deg"), -45.0), 45.0);
+	const double new_panini = std::min(std::max(obs_data_get_double(settings, "stab_panini"), 0.0), 1.0);
+	const bool framing_changed = new_tilt != context->stab_tilt_deg || new_panini != context->stab_panini;
+	context->stab_tilt_deg = new_tilt;
+	context->stab_panini = new_panini;
+	// Tilt/Panini change the identity-feasibility answer, and stab_black_edges
+	// is otherwise probed only at init (panel HIGH: a live slider move could
+	// silently pin the correction to zero via the degenerate clamp collapse -
+	// with Freeze View's corr_deg reading ~0 while the image jitters - or
+	// leave the clamp permanently off after sliding back). Re-probe here; the
+	// fields it reads are all re-init-gated, and the bool store is the same
+	// benign one-frame race as the sliders themselves.
+	if (framing_changed && context->initialized && context->stab_shader_ok) {
+		const bool was = context->stab_black_edges;
+		context->stab_black_edges =
+			!stab_corners_feasible(context, quatd{1.0, 0.0, 0.0, 0.0}, vec3d{0.0, 0.0, 0.0});
+		if (context->stab_black_edges && !was)
+			warn("stab: Tilt/Panini exceed the crop margin at this Zoom - corner clamp off, "
+			     "black edges will show; raise Zoom or reduce Tilt/Panini");
+	}
 
 	// Max 14, not 15: the pose-synthesis ring is 16 slots deep and delay 15
 	// asks for index n-16 - permanently one past the ring on PSVR2-class
@@ -1342,6 +1391,8 @@ static void win_openvr_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "stab_pair_phase", true);
 	obs_data_set_default_bool(settings, "stab_advanced", false);
 	obs_data_set_default_double(settings, "stab_lag_base_ms", 8.5);
+	obs_data_set_default_double(settings, "stab_tilt_deg", 0.0);
+	obs_data_set_default_double(settings, "stab_panini", 0.0);
 	obs_data_set_default_int(settings, "stab_pose_delay", -1); // Auto (Tier-1 crop fallback)
 	obs_data_set_default_bool(settings, "stab_debug", false);
 	obs_data_set_default_bool(settings, "stab_telemetry", false);
@@ -1615,6 +1666,31 @@ static double stab_effective_lag_s(win_openvr *context)
 		// Integer vsyncs-per-record with a +/-0.65 dead band around the
 		// held value (subsumes the earlier 1.6x/1.4x hysteresis).
 		const double r = D / V;
+		// Mixed-cadence detector. HARD LESSON (runs 61/62, 2026-07-26): a
+		// mixed span ratio degrades the IMAGE even when the classifier
+		// never flips - spans alternating 1V/2V under one fixed k turn the
+		// constant-duration mirror lag into a per-record ALTERNATING time
+		// error (+/-1V), which pose-domain telemetry cannot see at all
+		// (the run-40 blind spot; user ground truth re-confirmed it).
+		// So warn on the CONDITION - do not require flip symptoms.
+		{
+			const double frac = r - floor(r);
+			if (r > 1.2 && frac > 0.3 && frac < 0.7) {
+				if (context->stab_mixed_ticks < 600)
+					context->stab_mixed_ticks++;
+			} else if (context->stab_mixed_ticks > 0) {
+				context->stab_mixed_ticks--;
+			}
+			if (!context->stab_mixed_warned && context->stab_mixed_ticks > 300) {
+				context->stab_mixed_warned = true;
+				warn("stab: record spans are a mix of 1 and 2 vsyncs (span avg %.1f ms, "
+				     "vsync %.1f ms) - a fixed pairing offset alternates its time error "
+				     "and the image jitters even though pose telemetry looks clean. Set "
+				     "the headset to a refresh the game divides evenly (120 Hz for ~60 "
+				     "fps content), or cap/raise the game framerate to a clean fraction.",
+				     D * 1000.0, V * 1000.0);
+			}
+		}
 		int cand = context->stab_lag_n;
 		if (r > (double)context->stab_lag_n + 0.65 || r < (double)context->stab_lag_n - 0.65)
 			cand = (int)(r + 0.5);
@@ -1652,6 +1728,24 @@ static double stab_effective_lag_s(win_openvr *context)
 				context->stab_lag_n = cand;
 				context->stab_lag_dwell = 0;
 				context->stab_time_reanchor = true;
+				// Flip history: the WANDERING-cadence trigger (run 61:
+				// 6 flips in 71 s = repeated 22 ms pairing jumps). The
+				// mixed-ticks trigger above catches the OTHER variant -
+				// a STEADY 1V/2V mix that never flips the classifier yet
+				// jitters the image via per-record alternating time
+				// error (run 62, image-domain ground truth; pose
+				// telemetry is blind to it). BOTH triggers are
+				// load-bearing - delete neither.
+				context->stab_flip_t[context->stab_flip_pos & 3] = context->stab_last_t0;
+				context->stab_flip_pos++;
+				if (!context->stab_mixed_warned && stab_cadence_trouble(context)) {
+					context->stab_mixed_warned = true;
+					warn("stab: pipeline cadence is flapping (record span %.1f ms vs "
+					     "vsync %.1f ms, repeated mode flips) - stabilization may jump. "
+					     "Set the headset to a refresh the game divides evenly "
+					     "(e.g. 120 Hz for ~60 fps content).",
+					     D * 1000.0, V * 1000.0);
+				}
 			}
 		} else {
 			context->stab_lag_dwell = 0;
@@ -2647,8 +2741,12 @@ static void stab_compute_crop(win_openvr *context, const vr::Compositor_FrameTim
 // live in head space on the union canvas.
 static bool stab_corners_ok_wide(win_openvr *context, const quatd &q_err_head, const vec3d &posc_head)
 {
-	const quatd qA = quat_normalize(quat_mul(quat_conj(context->q_e2h), q_err_head));
-	const quatd qB = quat_normalize(quat_mul(quat_conj(context->q_e2h2), q_err_head));
+	// Mirror the shader exactly: tilt composed on the ray side of each eye's
+	// rotation, Panini applied to the canvas sample points below.
+	const double tilt_r = context->stab_tilt_deg * 0.008726646259971648;
+	const quatd q_tilt = {cos(tilt_r), sin(tilt_r), 0.0, 0.0};
+	const quatd qA = quat_normalize(quat_mul(quat_mul(quat_conj(context->q_e2h), q_err_head), q_tilt));
+	const quatd qB = quat_normalize(quat_mul(quat_mul(quat_conj(context->q_e2h2), q_err_head), q_tilt));
 	const vec3d pA = quat_rotate(quat_conj(context->q_e2h), posc_head);
 	const vec3d pB = quat_rotate(quat_conj(context->q_e2h2), posc_head);
 	const double W = (double)context->device_width, H = (double)context->device_height;
@@ -2687,17 +2785,27 @@ static bool stab_corners_ok_wide(win_openvr *context, const quatd &q_err_head, c
 		}
 		const double tx = lC + u * (rC - lC);
 		const double ty = bC - v * (bC - tC);
-		const vec3d ray = {tx, ty, -1.0};
+		vec3d ray;
+		double pscale = 1.0; // posc scales with the ray's z-magnitude (shader parity)
+		if (context->stab_panini > 1e-4) {
+			const double pd = context->stab_panini;
+			const double P = tx / (pd + 1.0), P2 = P * P;
+			const double cphi = (-P2 * pd + sqrt(P2 * (1.0 - pd * pd) + 1.0)) / (P2 + 1.0);
+			ray = {P * (pd + cphi), ty * (pd + cphi) / (pd + 1.0), -cphi};
+			pscale = cphi;
+		} else {
+			ray = {tx, ty, -1.0};
+		}
 		bool ok = false;
 		const vec3d dra = quat_rotate(qA, ray);
-		const vec3d da = {dra.x - pA.x, dra.y - pA.y, dra.z - pA.z};
+		const vec3d da = {dra.x - pA.x * pscale, dra.y - pA.y * pscale, dra.z - pA.z * pscale};
 		if (da.z < -0.1) {
 			const double px = da.x / -da.z, py = da.y / -da.z;
 			ok = px >= lA + iuA && px <= rA - iuA && py >= tA + ivA && py <= bA - ivA;
 		}
 		if (!ok) {
 			const vec3d drb = quat_rotate(qB, ray);
-			const vec3d db = {drb.x - pB.x, drb.y - pB.y, drb.z - pB.z};
+			const vec3d db = {drb.x - pB.x * pscale, drb.y - pB.y * pscale, drb.z - pB.z * pscale};
 			if (db.z < -0.1) {
 				const double px = db.x / -db.z, py = db.y / -db.z;
 				ok = px >= lB + iuB && px <= rB - iuB && py >= tB + ivB && py <= bB - ivB;
@@ -2722,7 +2830,13 @@ static bool stab_corners_feasible(win_openvr *context, const quatd &q_err_head, 
 // ~2 texel safety inset).
 static bool stab_corners_ok(win_openvr *context, const quatd &q_err_head, const vec3d &posc_eye)
 {
-	const quatd q_e = quat_mul(quat_mul(quat_conj(context->q_e2h), q_err_head), context->q_e2h);
+	// MUST mirror the shader's ray construction exactly - tilt composed on
+	// the ray side, Panini applied to the sample points - or the clamp lies
+	// about the margin those framing controls consume.
+	const quatd q_e0 = quat_mul(quat_mul(quat_conj(context->q_e2h), q_err_head), context->q_e2h);
+	const double tilt_r = context->stab_tilt_deg * 0.008726646259971648;
+	const quatd q_tilt = {cos(tilt_r), sin(tilt_r), 0.0, 0.0};
+	const quatd q_e = quat_mul(q_e0, q_tilt);
 	const double W = (double)context->device_width, H = (double)context->device_height;
 	const double l = (double)context->proj_left, r = (double)context->proj_right;
 	const double t = (double)context->proj_top, b = (double)context->proj_bottom;
@@ -2730,18 +2844,50 @@ static bool stab_corners_ok(win_openvr *context, const quatd &q_err_head, const 
 	const double iv = 2.0 * (b - t) / H;
 	const double us[2] = {(double)context->x / W, (double)(context->x + context->width) / W};
 	const double vs[2] = {(double)context->y / H, (double)(context->y + context->height) / H};
-	for (int i = 0; i < 2; i++) {
+	const double pd = context->stab_panini;
+	double pts[6][2];
+	int npts = 0;
+	for (int i = 0; i < 2; i++)
 		for (int j = 0; j < 2; j++) {
-			const double tx = l + us[i] * (r - l);
-			const double ty = b - vs[j] * (b - t);
-			const vec3d dr = quat_rotate(q_e, vec3d{tx, ty, -1.0});
-			const vec3d d = {dr.x - posc_eye.x, dr.y - posc_eye.y, dr.z - posc_eye.z};
-			if (!(d.z < -0.1))
-				return false;
-			const double px = d.x / -d.z, py = d.y / -d.z;
-			if (!(px >= l + iu && px <= r - iu && py >= t + iv && py <= b - iv))
-				return false;
+			pts[npts][0] = l + us[i] * (r - l);
+			pts[npts][1] = b - vs[j] * (b - t);
+			npts++;
 		}
+	if (pd > 1e-4) {
+		// Extra top/bottom-edge samples at tx nearest 0: they guard the
+		// NEAR-PLANE/HEMISPHERE test (d.z >= -0.1), whose extreme moves to
+		// tx=0 under tilt once ty*tan(tilt) > d+1 - both corners can pass
+		// while the edge center points backwards (panel, verified). The
+		// vertical FRUSTUM extreme (py) stays at the corners.
+		const double txmin = std::min(pts[0][0], pts[2][0]);
+		const double txmax = std::max(pts[0][0], pts[2][0]);
+		const double txc = std::min(std::max(0.0, txmin), txmax);
+		pts[4][0] = txc;
+		pts[4][1] = b - vs[0] * (b - t);
+		pts[5][0] = txc;
+		pts[5][1] = b - vs[1] * (b - t);
+		npts = 6;
+	}
+	for (int n = 0; n < npts; n++) {
+		const double tx = pts[n][0], ty = pts[n][1];
+		vec3d rayv;
+		double pscale = 1.0; // posc scales with the ray's z-magnitude (shader parity)
+		if (pd > 1e-4) {
+			const double P = tx / (pd + 1.0), P2 = P * P;
+			const double cphi = (-P2 * pd + sqrt(P2 * (1.0 - pd * pd) + 1.0)) / (P2 + 1.0);
+			rayv = {P * (pd + cphi), ty * (pd + cphi) / (pd + 1.0), -cphi};
+			pscale = cphi;
+		} else {
+			rayv = {tx, ty, -1.0};
+		}
+		const vec3d dr = quat_rotate(q_e, rayv);
+		const vec3d d = {dr.x - posc_eye.x * pscale, dr.y - posc_eye.y * pscale,
+				 dr.z - posc_eye.z * pscale};
+		if (!(d.z < -0.1))
+			return false;
+		const double px = d.x / -d.z, py = d.y / -d.z;
+		if (!(px >= l + iu && px <= r - iu && py >= t + iv && py <= b - iv))
+			return false;
 	}
 	return true;
 }
@@ -3030,6 +3176,16 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 	// space, so the correction is conjugated into it (conj(e)*q*e). Wide
 	// mode: canvas rays live in HEAD space, so each eye's matrix carries
 	// the head->eye rotation itself (conj(e)*q).
+	// Framing tilt: a constant pitch of the OUTPUT camera, composed on the
+	// canvas-ray side (right-multiplied) so it rides the stabilized view -
+	// unlike the pixel offsets, this reprojects. Positive tilts the view up.
+	// Gated on stabilize: in wide-without-stab the warp still runs but the
+	// clamp does not, the sliders are hidden, and the tooltips say "requires
+	// Stabilization" - an invisible active control with no feasibility
+	// protection is a user trap (panel). Matches single-eye-no-stab.
+	const double tilt_r =
+		(context->stabilize ? context->stab_tilt_deg : 0.0) * 0.008726646259971648; // deg/2 in rad
+	const quatd q_tilt = {cos(tilt_r), sin(tilt_r), 0.0, 0.0};
 	const quatd qA = context->wide_active
 				 ? quat_mul(quat_conj(context->q_e2h), q_err)
 				 : quat_mul(quat_mul(quat_conj(context->q_e2h), q_err), context->q_e2h);
@@ -3055,7 +3211,8 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 	cb.poscA[0] = (float)pA.x;
 	cb.poscA[1] = (float)pA.y;
 	cb.poscA[2] = (float)pA.z;
-	quat_to_mat4(quat_normalize(qA), cb.RdA);
+	cb.poscA[3] = context->stabilize ? (float)context->stab_panini : 0.0f;
+	quat_to_mat4(quat_normalize(quat_mul(qA, q_tilt)), cb.RdA);
 	if (context->wide_active) {
 		const quatd qB = quat_mul(quat_conj(context->q_e2h2), q_err);
 		const vec3d pB = quat_rotate(quat_conj(context->q_e2h2), posc_h);
@@ -3066,7 +3223,7 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 		cb.poscB[0] = (float)pB.x;
 		cb.poscB[1] = (float)pB.y;
 		cb.poscB[2] = (float)pB.z;
-		quat_to_mat4(quat_normalize(qB), cb.RdB);
+		quat_to_mat4(quat_normalize(quat_mul(qB, q_tilt)), cb.RdB);
 	}
 
 	ID3D11DeviceContext *ctx = context->shared_context.Get();
@@ -3209,7 +3366,14 @@ static bool stab_ui_modd(obs_properties_t *props, obs_property_t *property, obs_
 	// Frame is back under Advanced as the capture-cost A/B switch.
 	const bool adv = obs_data_get_bool(settings, "stab_advanced");
 	bool changed = set_vis(props, "stab_zoom_warning", on && nomargin);
+	// The cadence warning's ON-visibility is decided at panel build (only
+	// place the runtime trouble state is known); hide it here when the user
+	// unchecks Stabilization so it cannot linger as the lone stab control.
+	if (!on)
+		changed |= set_vis(props, "stab_cadence_warning", false);
 	changed |= set_vis(props, "stab_preset", on);
+	changed |= set_vis(props, "stab_tilt_deg", on);
+	changed |= set_vis(props, "stab_panini", on);
 	changed |= set_vis(props, "stab_roll_lock", on);
 	changed |= set_vis(props, "stab_advanced", on);
 	changed |= set_vis(props, "stab_filter", on && adv);
@@ -3236,6 +3400,25 @@ static bool stab_ui_modd(obs_properties_t *props, obs_property_t *property, obs_
 		}
 	}
 	return changed;
+}
+
+// Runtime cadence-trouble predicate: sustained mixed spans OR 3+ classifier
+// flips inside a minute. BOTH matter - flips jump the pairing 2V at a time
+// (run 61), while a steady 1V/2V mix alternates the pairing time error with
+// ZERO flips and pristine pose telemetry (run 62, image-domain ground truth
+// from the user). Read on the UI thread from plain ints - stale-by-a-tick is
+// fine for a warning row.
+static bool stab_cadence_trouble(win_openvr *context)
+{
+	if (context->stab_mixed_ticks > 300)
+		return true;
+	if (context->stab_flip_pos < 3)
+		return false;
+	const double newest = context->stab_flip_t[(context->stab_flip_pos - 1) & 3];
+	const double third = context->stab_flip_t[(context->stab_flip_pos - 3) & 3];
+	// Recency: three flips from an old load stutter must not pin the warning
+	// for the rest of the session (panel).
+	return newest > 0.0 && newest - third < 60.0 && context->stab_last_t0 - newest < 60.0;
 }
 
 static bool ar_modd(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
@@ -3291,6 +3474,18 @@ static obs_properties_t *win_openvr_properties(void *data)
 	obs_property_set_modified_callback(p, stab_ui_modd);
 	p = obs_properties_add_int(props, "x_offset", obs_module_text("Horizontal Offset"), -10000, 10000, 1);
 	p = obs_properties_add_int(props, "y_offset", obs_module_text("Vertical Offset"), -10000, 10000, 1);
+	p = obs_properties_add_float_slider(props, "stab_tilt_deg", obs_module_text("Camera Tilt (deg)"), -45.0, 45.0,
+					    0.1);
+	obs_property_set_long_description(
+		p, obs_module_text("Pitches the projected view up (+) or down (-) relative to the STABILIZED "
+				   "view - a true reprojection, unlike the pixel offsets. Consumes crop "
+				   "margin like corrections do. Requires Stabilization (shader path)."));
+	p = obs_properties_add_float_slider(props, "stab_panini", obs_module_text("Panini Projection"), 0.0, 1.0, 0.01);
+	obs_property_set_long_description(
+		p, obs_module_text("0 = normal perspective. Higher values widen the view and compress the "
+				   "horizontal periphery with straight verticals - the action-cam look. "
+				   "Widens the field of view: combine with Zoom to frame. Requires "
+				   "Stabilization (shader path)."));
 
 	// Stabilization
 	p = obs_properties_add_bool(props, "stabilize", obs_module_text("Stabilization (Experimental)"));
@@ -3303,6 +3498,18 @@ static obs_properties_t *win_openvr_properties(void *data)
 						    "Increase Zoom (1.2+) to hide them."),
 				    OBS_TEXT_INFO);
 	obs_property_text_set_info_type(p, OBS_TEXT_INFO_WARNING);
+	// Runtime warning: visibility decided from measured state when the panel
+	// opens (properties cannot refresh themselves while idle - the OBS log
+	// carries the same warning the moment the condition first sustains).
+	p = obs_properties_add_text(
+		props, "stab_cadence_warning",
+		obs_module_text("Headset refresh and game framerate are in a mixed ratio (e.g. 90 Hz "
+				"with ~60 fps content) - stabilization cannot pair reliably and may "
+				"jump. Set the headset to a refresh the game divides evenly: 120 Hz "
+				"for ~60 fps content, or lower the refresh to match the game."),
+		OBS_TEXT_INFO);
+	obs_property_text_set_info_type(p, OBS_TEXT_INFO_WARNING);
+	obs_property_set_visible(p, false);
 	p = obs_properties_add_list(props, "stab_preset", obs_module_text("Strength"), OBS_COMBO_TYPE_LIST,
 				    OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(p, obs_module_text("Low"), 1);
@@ -3383,6 +3590,8 @@ static obs_properties_t *win_openvr_properties(void *data)
 		obs_data_t *settings = obs_source_get_settings(context->source);
 		ar_modd(props, NULL, settings);
 		stab_ui_modd(props, NULL, settings);
+		obs_property_set_visible(obs_properties_get(props, "stab_cadence_warning"),
+					 obs_data_get_bool(settings, "stabilize") && stab_cadence_trouble(context));
 		obs_data_release(settings);
 	}
 
