@@ -1482,7 +1482,8 @@ struct StabPairInfo {
 	int lag_mode;      // classifier state: vsyncs per record (1 = native)
 	int cap_used;      // 1 = warped a boundary-locked slot, 0 = fallback path
 	double cap_phase_ms; // capture instant relative to its record boundary
-	int pair_future;   // 1 = A0 guard fired: target past the newest ring stamp
+	int pair_future;   // cap path: 1 = ahead-served (record one past cur, pose ring);
+			   // hold fallback still uses the A0 guard meaning
 	int eff_delay;      // cur - used frame index; differs on a fallback
 	double age_ms;      // how far back in TIME the used record sits
 	uint32_t presents;  // >1 would mean the scene texture was reused
@@ -1973,6 +1974,12 @@ static DWORD WINAPI stab_poll_proc(LPVOID param)
 				last = t.m_nFrameIndex;
 				have = true;
 				stab_probe_write(context, wake.QuadPart, &t);
+				// A pending due from the PREVIOUS record must die here
+				// unconditionally: firing it after this boundary would
+				// build a slot whose cap_idx, cap_qpc and pixels describe
+				// three different records - and the deterministic selector
+				// now trusts cap_idx (panel, detpair review).
+				context->stab_cap_due = 0;
 				// Schedule this record's mid-slot capture. A wake that was
 				// itself late (>3 ms gap) detected this boundary late too -
 				// its stamp is already suspect, so sit this record out
@@ -2176,6 +2183,12 @@ static bool stab_fetch_pose(win_openvr *context, const vr::Compositor_FrameTimin
 		if (vr::VRCompositor()->GetFrameTiming(&past, (uint32_t)pose_delay))
 			used = &past;
 	}
+	// pose_delay == -1: the deterministic selector wants the record ONE AHEAD
+	// of cur - it has no timing record yet on this tick phase, but the pose
+	// ring already holds its pose (slot i carries the pose of record i+1) and
+	// its timestamp is one nominal record period past cur's. Only the warp's
+	// capture path requests this; the Tier-1 resolver never returns negatives.
+	const bool ahead = pose_delay < 0;
 	const vr::TrackedDevicePose_t *pose = &used->m_HmdPose;
 
 	if (info_out) {
@@ -2196,7 +2209,7 @@ static bool stab_fetch_pose(win_openvr *context, const vr::Compositor_FrameTimin
 		info_out->transfer_ms = used->m_flTransferLatencyMs;
 	}
 
-	if (pose->bPoseIsValid && pose->eTrackingResult == vr::TrackingResult_Running_OK) {
+	if (!ahead && pose->bPoseIsValid && pose->eTrackingResult == vr::TrackingResult_Running_OK) {
 		*q_out = quat_normalize(quat_from_hmd34(pose->mDeviceToAbsoluteTracking));
 		const vr::HmdMatrix34_t &hm = pose->mDeviceToAbsoluteTracking;
 		*p_out = {hm.m[0][3], hm.m[1][3], hm.m[2][3]};
@@ -2210,11 +2223,16 @@ static bool stab_fetch_pose(win_openvr *context, const vr::Compositor_FrameTimin
 		// the writer recycles the oldest slot underneath scanners, and a
 		// fully rewritten quat is unit-norm so a norm check alone cannot
 		// catch it.
-		const uint32_t wantidx = used->m_nFrameIndex - 1;
+		const uint32_t wantidx = used->m_nFrameIndex - (ahead ? 0u : 1u);
 		bool synth_ok = false;
 		quatd q = {1.0, 0.0, 0.0, 0.0};
 		vec3d p = {0.0, 0.0, 0.0};
-		for (int back = 0; back < 2 && !synth_ok; back++) {
+		// Ahead mode gets NO neighbor fallback: slot cur-1 holds pose(cur),
+		// the exact one-record-early substitute the contract forbids - an
+		// ahead miss must fall through to the caller's hold-last path
+		// (panel, detpair review: back=1 in ahead mode was the alternation
+		// class reintroduced).
+		for (int back = 0; back < (ahead ? 1 : 2) && !synth_ok; back++) {
 			const uint32_t idx = wantidx - (uint32_t)back;
 			for (int i = 0; i < 16; i++) {
 				if (context->stab_poll_idx[i] != idx ||
@@ -2235,7 +2253,11 @@ static bool stab_fetch_pose(win_openvr *context, const vr::Compositor_FrameTimin
 			// the pre-synthesis behavior - collapse to cur's valid pose
 			// rather than popping the correction. On PSVR2 cur's pose is
 			// invalid too, so this never masks a real ring miss there.
-			if (cur->m_HmdPose.bPoseIsValid &&
+			// NOT for ahead-requests: substituting cur's pose there is a
+			// one-record-early mispair that alternates with tick phase -
+			// the caller's hold-last-correction path is the consistent
+			// answer for those (~1 ms poller-stamp race frames).
+			if (!ahead && cur->m_HmdPose.bPoseIsValid &&
 			    cur->m_HmdPose.eTrackingResult == vr::TrackingResult_Running_OK) {
 				const vr::HmdMatrix34_t &cm = cur->m_HmdPose.mDeviceToAbsoluteTracking;
 				*q_out = quat_normalize(quat_from_hmd34(cm));
@@ -2260,6 +2282,14 @@ static bool stab_fetch_pose(win_openvr *context, const vr::Compositor_FrameTimin
 		*p_out = p;
 	}
 	*t_out = used->m_flSystemTimeInSeconds;
+	if (ahead) {
+		// Quantized grid, NOT the period EMA: under load the EMA sits
+		// 1.5-3.5 ms above modal spacing (rule 1 at the lag classifier)
+		// and would jitter dt on exactly the phase-dependent subset of
+		// frames that gets ahead-served.
+		const double Vs = context->stab_vsync_s > 0.0 ? context->stab_vsync_s : 1.0 / 120.0;
+		*t_out += (double)std::max(context->stab_lag_n, 1) * Vs;
+	}
 	*frozen_out = (used->m_nReprojectionFlags & vr::VRCompositor_ReprojectionMotion) != 0;
 	return true;
 }
@@ -2782,35 +2812,35 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 		stab_track_cadence(context, cur);
 		const double eff_lag = stab_effective_lag_s(context);
 		int want;
+		bool want_ok = true;
 		if (use_cap) {
-			// Pairing bound by the slot's own capture stamp. On a failed
-			// ring lookup, REUSE the last pairing - never switch to a
-			// different selector mid-session: a consistent repeat glides
-			// through the reanchor, an alternating rule-change is shake.
-			const int64_t target = context->cap_qpc[cap_slot] +
-					       (int64_t)(eff_lag * (double)context->stab_qpc_freq);
-			uint32_t idx = stab_record_at_qpc(context, target);
-			// Future-target guard (panel A0, HIGH): with positive lag the
-			// target can sit past the newest ring stamp while its deciding
-			// boundary has ALREADY happened - the render gate saw the new
-			// index up to ~1 ms before the poller stamped it. The ring then
-			// returns the previous record: found-but-WRONG, alternating with
-			// tick phase. In that window the render thread's own
-			// GetFrameTiming(0) is fresher than the ring: the newest record
-			// IS cur.
-			{
-				const int rpos = (int)context->stab_poll_pos;
-				if (target > context->stab_poll_qpc[rpos] &&
-				    (int32_t)(cur->m_nFrameIndex - context->stab_poll_idx[rpos]) > 0) {
-					idx = cur->m_nFrameIndex;
-					pair.pair_future = 1;
-				}
-			}
-			want = idx ? (int)(cur->m_nFrameIndex - idx)
-				   : (context->stab_has_sel ? (int)(cur->m_nFrameIndex - context->stab_last_sel)
-							    : context->stab_pair_frames);
-			want = std::min(std::max(want, 0), 4);
-			context->stab_extrap_s = 0.0; // never predict from a capture
+			// DETERMINISTIC pairing (v3): the slot knows its own record
+			// index, so selection is pure arithmetic - the record whose
+			// span contains (capture instant + lag) on the nominal grid.
+			// No QPC ring search and no future-target race: the old
+			// target-vs-newest-stamp comparison was decided by tick phase
+			// and alternated at every non-phase-locked canvas/refresh
+			// ratio (runs 40/45; 80/60 and 90/60 field reports). floor()
+			// makes every lag within one record span select identically,
+			// so the exact-boundary knife edges (8.33, run 45) are gone by
+			// construction. k = +1 selects a record that may not exist yet
+			// at render time on some tick phases; stab_fetch_pose serves
+			// its pose from the pose ring (slot i holds pose i+1), stamped
+			// before this frame's capture completed.
+			const double Vs = context->stab_vsync_s > 0.0 ? context->stab_vsync_s : 1.0 / 120.0;
+			const double nV = (double)std::max(context->stab_lag_n, 1) * Vs;
+			int k = (int)floor((0.5 * Vs + eff_lag) / nV);
+			k = std::min(std::max(k, -4), 1); // the ring serves at most one record ahead
+			const uint32_t sel_det = context->cap_idx[cap_slot] + (uint32_t)(int32_t)k;
+			const int want_raw = (int)(int32_t)(cur->m_nFrameIndex - sel_det);
+			// want_raw < -1: the render thread stalled across a boundary and
+			// its cur snapshot is stale - no pose exists even in the ring.
+			// Treat as a fetch miss (hold-last answers) instead of silently
+			// pairing one record early through the clamp (panel).
+			want_ok = want_raw >= -1;
+			want = std::min(std::max(want_raw, -1), 4); // -1 = one ahead of cur, ring-served
+			pair.pair_future = want < 0 ? 1 : 0;    // repurposed: ahead-serve rate
+			context->stab_extrap_s = 0.0;           // never predict from a capture
 		} else if (use_hold) {
 			// Retrospective pairing: which record was newest when the GPU
 			// actually sampled the pixels we are about to warp? That instant
@@ -2841,7 +2871,7 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 		context->stab_last_sel = sel;
 		context->stab_has_sel = true;
 
-		bool have = stab_fetch_pose(context, cur, want, &q_a, &p_a, &t_a, &frozen, &pair);
+		bool have = want_ok && stab_fetch_pose(context, cur, want, &q_a, &p_a, &t_a, &frozen, &pair);
 
 		// Compositor drops emit adjacent records with equal or slightly
 		// REGRESSED timestamps (measured: 0 to -45 us, always dropped=1). The
