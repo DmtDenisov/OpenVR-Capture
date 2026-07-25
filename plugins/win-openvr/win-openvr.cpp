@@ -424,6 +424,8 @@ struct win_openvr {
 	double stab_lag_base_ms; // native lag; own key so a stale manual slider cannot poison auto
 	int stab_lag_n;          // classifier: vsyncs per record (1 = native)
 	int stab_lag_dwell;      // ticks the candidate cadence has persisted
+	int stab_flag_recent;    // armed flag horizon, records (150 -> 0; armed on corroborated flags only)
+	int stab_flag_streak;    // corroboration window: records since the last flagged record (30 -> 0)
 	double stab_vsync_s;     // cached 1/Prop_DisplayFrequency_Float, 0 = unknown
 	int stab_vsync_wait;     // probe backoff after a failed query
 	bool stab_vsync_warned;
@@ -912,6 +914,8 @@ static void win_openvr_init(void *data, bool forced = true)
 				}
 
 				context->stab_has_state = false;
+				context->stab_flag_recent = 0; // fresh session, fresh flag horizon
+				context->stab_flag_streak = 0;
 				context->stab_lock_captured = false; // full-lock re-captures on re-init
 				if (context->stabilize && (context->width == base_w ||
 							   context->height == base_h)) {
@@ -1552,11 +1556,35 @@ static void stab_track_cadence(win_openvr *context, const vr::Compositor_FrameTi
 					? context->stab_rec_period + 0.05 * (per - context->stab_rec_period)
 					: per;
 	}
+	// Wall-clock gap (dashboard pause, app switch): a stale flag horizon
+	// must not survive into the resumed session's classification. Checked
+	// BEFORE stab_last_t0 updates - after it the gap always reads zero.
+	if (context->stab_last_t0 > 0.0 && t0 - context->stab_last_t0 > 1.0) {
+		context->stab_flag_recent = 0;
+		context->stab_flag_streak = 0;
+	}
 	context->stab_last_t0 = t0;
 	context->stab_last_dframe = dframe;
 	if (context->stab_dframe_avg <= 0.0)
 		context->stab_dframe_avg = 1.0;
 	context->stab_dframe_avg += 0.0165 * ((double)dframe - context->stab_dframe_avg);
+	// Flag channel for the classifier (Rift S / Oculus bridge): the driver
+	// marks motion-smoothed records per frame - per-frame TRUTH the cadence
+	// EMA can only infer with dwell lag. CORROBORATION before arming (panel):
+	// a lone flagged record is the isolated-hitch artifact class and must not
+	// buy ~300 records of wrong mode on a native rig - arm only on a second
+	// flagged record within 30. Real ASW flags continuously, so entry is
+	// delayed by exactly one record. The wall-clock gap reset lives above,
+	// before stab_last_t0 updates. Post-ASW return to native costs flag
+	// horizon + exit dwell (~300 records) by design.
+	if (cur->m_nReprojectionFlags & vr::VRCompositor_ReprojectionMotion) {
+		if (context->stab_flag_streak > 0)
+			context->stab_flag_recent = 150;
+		context->stab_flag_streak = 30;
+	} else if (context->stab_flag_recent > 0 || context->stab_flag_streak > 0) {
+		context->stab_flag_recent = std::max(0, context->stab_flag_recent - (int)std::min(dframe, 15u));
+		context->stab_flag_streak = std::max(0, context->stab_flag_streak - (int)std::min(dframe, 15u));
+	}
 }
 
 // Effective mirror lag. Auto mode classifies the pipeline from the measured
@@ -1591,6 +1619,14 @@ static double stab_effective_lag_s(win_openvr *context)
 		if (r > (double)context->stab_lag_n + 0.65 || r < (double)context->stab_lag_n - 0.65)
 			cand = (int)(r + 0.5);
 		cand = std::min(std::max(cand, 1), 4);
+		// Flag floor: while motion-smoothed records are recent, the pipeline
+		// IS reprojected regardless of what the cadence EMA reads - Oculus
+		// ASW flaps the record rate between full and half, parking the EMA
+		// mid-band where the dwelled classifier followed it back and forth
+		// with 25 ms pairing jumps (Rift S runs 54/55). The EMA may still
+		// RAISE n above 2 on genuine 3-4 vsync spans.
+		if (context->stab_flag_recent > 0 && cand < 2)
+			cand = 2;
 		if (cand != context->stab_lag_n) {
 			// Asymmetric dwell. Entering DEEPER reprojection flips fast
 			// (~0.5 s): the native runs show zero reproj-direction bursts,
@@ -1601,7 +1637,14 @@ static double stab_effective_lag_s(win_openvr *context)
 			// those is worse than riding them out.
 			// Dwell counts RECORDS, not warp ticks, so the wall time is
 			// rate-agnostic (ticks halve at canvas 30; records do not).
-			const int need = (cand > context->stab_lag_n) ? 30 : 150;
+			// Flag-verified entry is INSTANT - but ONLY for the transition
+			// the flag actually attests (into n=2). Deeper flips (2->3,
+			// 3->4) are EMA inference and keep their 30-record dwell, else
+			// sustained ASW would let every span excursion flip with zero
+			// dwell and pay the 150-record exit to undo (panel).
+			const int need = (cand > context->stab_lag_n)
+						 ? ((context->stab_flag_recent > 0 && cand == 2) ? 0 : 30)
+						 : 150;
 			context->stab_lag_dwell += (int)(context->stab_last_dframe ? context->stab_last_dframe : 1);
 			if (context->stab_lag_dwell >= need) {
 				info("stab: auto lag %d -> %d vsyncs/record (record %.2f ms, vsync %.2f ms)",
@@ -2027,8 +2070,16 @@ static void stab_poll_start(win_openvr *context)
 	context->stab_probe_failed = false;
 	InterlockedExchange(&context->stab_poll_run, 1);
 	context->stab_poll_thread = CreateThread(nullptr, 0, stab_poll_proc, context, 0, nullptr);
-	if (!context->stab_poll_thread)
+	if (!context->stab_poll_thread) {
 		warn("stab: could not start the frame-boundary poller; phase will be unavailable");
+	} else {
+		// TIME_CRITICAL: this is a 1 kHz timing thread that sleeps 999 of
+		// every 1000 microseconds - starving it is expensive (run 58:
+		// encoder workers at Recording Start pushed capture misses from
+		// ~2/s to 15/s = 19% repeated frames, read as judder), and its
+		// work per wake is microseconds, so it cannot starve anyone else.
+		SetThreadPriority(context->stab_poll_thread, THREAD_PRIORITY_TIME_CRITICAL);
+	}
 }
 
 static void stab_poll_stop(win_openvr *context)
