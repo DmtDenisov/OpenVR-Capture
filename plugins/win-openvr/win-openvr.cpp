@@ -244,7 +244,7 @@ cbuffer StabParams : register(b0)
 	float4 crop;  // crop rect in canvas uv: u0, v0, du, dv
 	float4 misc;  // x: re-encode srgb, y: wide mode, z: blend band (tangent units),
 		      // w: +1 A's nasal edge is its left, -1 it's its right
-	float4 poscA; // xyz: positional correction / reference depth (eye A space)
+	float4 poscA; // xyz: positional correction / reference depth (eye A space); w: Panini d
 	float4 poscB; // xyz: same, eye B space
 	float4x4 RdA; // eye A <- smoothed rotation
 	float4x4 RdB; // eye B <- smoothed rotation
@@ -279,9 +279,28 @@ float4 PSMain(VSOut i) : SV_Target
 	float2 uvV = crop.xy + i.uv * crop.zw;
 	float tx = frC.x + uvV.x * (frC.y - frC.x);
 	float ty = frC.w - uvV.y * (frC.w - frC.z);
-	float3 ray = float3(tx, ty, -1.0);
+	float3 ray;
+	float pscale = 1.0;
+	float pd = poscA.w;
+	if (pd > 1e-4) {
+		// Inverse cylindrical Panini (straight verticals). d = 0 reduces to
+		// exactly the rectilinear ray below; raising d widens the view and
+		// compresses the horizontal periphery - the action-cam look.
+		float P = tx / (pd + 1.0);
+		float P2 = P * P;
+		float cphi = (-P2 * pd + sqrt(P2 * (1.0 - pd * pd) + 1.0)) / (P2 + 1.0);
+		float sphi = P * (pd + cphi);
+		float tv = ty * (pd + cphi) / (pd + 1.0);
+		ray = float3(sphi, tv, -cphi);
+		// The Panini ray's z-magnitude is cphi (<= 1), not 1: scale the
+		// positional term to match, else it amplifies by 1/cphi toward the
+		// periphery and steps discontinuously the moment d leaves 0.
+		pscale = cphi;
+	} else {
+		ray = float3(tx, ty, -1.0);
+	}
 
-	float3 dA = mul((float3x3)RdA, ray) - poscA.xyz;
+	float3 dA = mul((float3x3)RdA, ray) - poscA.xyz * pscale;
 	float2 tA = dA.xy / max(-dA.z, 1e-6);
 	float2 uvA = float2((tA.x - frA.x) / (frA.y - frA.x), (frA.w - tA.y) / (frA.w - frA.z));
 
@@ -289,7 +308,7 @@ float4 PSMain(VSOut i) : SV_Target
 	if (misc.y < 0.5) {
 		c = imgA.Sample(smp, uvA);
 	} else {
-		float3 dB = mul((float3x3)RdB, ray) - poscB.xyz;
+		float3 dB = mul((float3x3)RdB, ray) - poscB.xyz * pscale;
 		float2 tB = dB.xy / max(-dB.z, 1e-6);
 		float2 uvB = float2((tB.x - frB.x) / (frB.y - frB.x), (frB.w - tB.y) / (frB.w - frB.z));
 
@@ -315,6 +334,7 @@ float4 PSMain(VSOut i) : SV_Target
 // Width of the wide-mode blend band at the dominant eye's nasal edge, in
 // tangent units (~4.5 degrees).
 #define STAB_BLEND_BAND 0.08f
+
 
 // Auto pose-delay vote window, in compositor frames (~1.3 s at 90 fps).
 #define STAB_AUTO_WIN 120
@@ -382,11 +402,16 @@ struct win_openvr {
 	bool stab_lock_captured;
 	bool stab_pos_comp;
 	double stab_pos_depth;
+	double stab_tilt_deg; // camera pitch relative to the STABILIZED view (+up), shader path only
+	double stab_panini;   // Panini projection d, 0 = rectilinear (shader path only)
 	int stab_pose_delay;
 	bool stab_debug;
 	bool stab_telemetry;
 	FILE *stab_telemetry_file;
 	uint32_t stab_telemetry_lines;
+	FILE *stab_probe_file; // pose-source probe CSV; poller thread owns it exclusively
+	uint32_t stab_probe_lines;
+	int64_t stab_probe_qpc0;
 
 	quatd stab_q_ref; // raw pose of the displayed frame (telemetry)
 
@@ -420,6 +445,12 @@ struct win_openvr {
 	double stab_lag_base_ms; // native lag; own key so a stale manual slider cannot poison auto
 	int stab_lag_n;          // classifier: vsyncs per record (1 = native)
 	int stab_lag_dwell;      // ticks the candidate cadence has persisted
+	int stab_flag_recent;    // armed flag horizon, records (150 -> 0; armed on corroborated flags only)
+	int stab_flag_streak;    // corroboration window: records since the last flagged record (30 -> 0)
+	int stab_mixed_ticks;    // mixed-span detector: warp ticks with spans parked mid-band
+	double stab_flip_t[4];   // last 4 accepted classifier flip times (pose clock)
+	int stab_flip_pos;
+	bool stab_mixed_warned;  // one-shot log warn per session
 	double stab_vsync_s;     // cached 1/Prop_DisplayFrequency_Float, 0 = unknown
 	int stab_vsync_wait;     // probe backoff after a failed query
 	bool stab_vsync_warned;
@@ -440,6 +471,20 @@ struct win_openvr {
 	volatile LONG stab_poll_pos;
 	uint32_t stab_poll_idx[16];
 	int64_t stab_poll_qpc[16];
+	// Pose ring beside the stamp ring (PSVR2-class drivers ship records with
+	// bPoseIsValid=false). GetLastPoses sampled at boundary i carries the
+	// pose of record i+1 EXACTLY (probe 49: residual p50 0.0000 deg at a
+	// +1.00-record shift vs the embedded pose). Writer: payload stores, then
+	// pok published via InterlockedExchange. READERS DO NOT GO THROUGH
+	// stab_poll_pos - they scan slots by index match and must re-verify
+	// idx+pok AFTER loading the payload (seqlock-lite) because the writer
+	// recycles the oldest slot underneath them.
+	quatd stab_poll_pq[16];  // GetLastPoses render pose (quat) per boundary
+	vec3d stab_poll_pp[16];  // and its position
+	LONG stab_poll_pok[16];  // pose valid + tracking OK + stamped on time
+	bool stab_synth_logged;   // one-shot log when synthesis first engages
+	bool stab_synth_t0_warned; // one-shot warn: synthesized record had no timestamp
+	bool stab_probe_failed;    // probe fopen failed - stop retrying at boundary rate
 	int64_t stab_qpc_freq;
 
 	// Boundary-locked capture: the poller copies the mirror at MID-SLOT
@@ -499,6 +544,8 @@ struct win_openvr {
 	// Filter state
 	bool stab_has_state;
 	quatd q_smooth;
+	double stab_knee_u;  // telemetry: correction target / feasibility ceiling (999 = degenerate)
+	double stab_lim_deg; // telemetry: withheld fold deg this frame (negative = snapped)
 	quatd q_prev_raw; // One Euro speed estimate
 	double omega_lp;  // One Euro speed estimate, low-passed (rad/s)
 	double prev_pose_time;
@@ -621,6 +668,7 @@ static void destroy_obs_texture(gs_texture_t **texture) {
 static void stab_poll_start(win_openvr *context);
 static void stab_poll_stop(win_openvr *context);
 static double stab_phase_of(win_openvr *context, uint32_t frame_index);
+static bool stab_cadence_trouble(win_openvr *context);
 
 // Stack-only RAII for the GPU lock (the context struct stays POD; SRWLOCK's
 // zero state is valid, so bzalloc initializes it). Defined before
@@ -892,6 +940,11 @@ static void win_openvr_init(void *data, bool forced = true)
 				}
 
 				context->stab_has_state = false;
+				context->stab_flag_recent = 0; // fresh session, fresh flag horizon
+				context->stab_flag_streak = 0;
+				context->stab_mixed_ticks = 0;
+				context->stab_flip_pos = 0;
+				context->stab_mixed_warned = false;
 				context->stab_lock_captured = false; // full-lock re-captures on re-init
 				if (context->stabilize && (context->width == base_w ||
 							   context->height == base_h)) {
@@ -1259,8 +1312,31 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 		context->stab_has_state = false; // reseed the position state cleanly
 	context->stab_pos_comp = stab_pos_comp;
 	context->stab_pos_depth = std::min(std::max(obs_data_get_double(settings, "stab_pos_depth"), 0.3), 100.0);
+	const double new_tilt = std::min(std::max(obs_data_get_double(settings, "stab_tilt_deg"), -45.0), 45.0);
+	const double new_panini = std::min(std::max(obs_data_get_double(settings, "stab_panini"), 0.0), 1.0);
+	const bool framing_changed = new_tilt != context->stab_tilt_deg || new_panini != context->stab_panini;
+	context->stab_tilt_deg = new_tilt;
+	context->stab_panini = new_panini;
+	// Tilt/Panini change the identity-feasibility answer, and stab_black_edges
+	// is otherwise probed only at init (panel HIGH: a live slider move could
+	// silently pin the correction to zero via the degenerate clamp collapse -
+	// with Freeze View's corr_deg reading ~0 while the image jitters - or
+	// leave the clamp permanently off after sliding back). Re-probe here; the
+	// fields it reads are all re-init-gated, and the bool store is the same
+	// benign one-frame race as the sliders themselves.
+	if (framing_changed && context->initialized && context->stab_shader_ok) {
+		const bool was = context->stab_black_edges;
+		context->stab_black_edges =
+			!stab_corners_feasible(context, quatd{1.0, 0.0, 0.0, 0.0}, vec3d{0.0, 0.0, 0.0});
+		if (context->stab_black_edges && !was)
+			warn("stab: Tilt/Panini exceed the crop margin at this Zoom - corner clamp off, "
+			     "black edges will show; raise Zoom or reduce Tilt/Panini");
+	}
 
-	int stab_pose_delay = std::min(std::max((int)obs_data_get_int(settings, "stab_pose_delay"), -1), 15);
+	// Max 14, not 15: the pose-synthesis ring is 16 slots deep and delay 15
+	// asks for index n-16 - permanently one past the ring on PSVR2-class
+	// drivers (panel). Auto mode caps at 3; only hand-set configs get here.
+	int stab_pose_delay = std::min(std::max((int)obs_data_get_int(settings, "stab_pose_delay"), -1), 14);
 	if (stab_pose_delay != context->stab_pose_delay) {
 		context->stab_auto_pos = 0;
 		context->stab_auto_cnt = 0; // restart the vote window
@@ -1315,6 +1391,8 @@ static void win_openvr_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "stab_pair_phase", true);
 	obs_data_set_default_bool(settings, "stab_advanced", false);
 	obs_data_set_default_double(settings, "stab_lag_base_ms", 8.5);
+	obs_data_set_default_double(settings, "stab_tilt_deg", 0.0);
+	obs_data_set_default_double(settings, "stab_panini", 0.0);
 	obs_data_set_default_int(settings, "stab_pose_delay", -1); // Auto (Tier-1 crop fallback)
 	obs_data_set_default_bool(settings, "stab_debug", false);
 	obs_data_set_default_bool(settings, "stab_telemetry", false);
@@ -1459,7 +1537,8 @@ struct StabPairInfo {
 	int lag_mode;      // classifier state: vsyncs per record (1 = native)
 	int cap_used;      // 1 = warped a boundary-locked slot, 0 = fallback path
 	double cap_phase_ms; // capture instant relative to its record boundary
-	int pair_future;   // 1 = A0 guard fired: target past the newest ring stamp
+	int pair_future;   // cap path: 1 = ahead-served (record one past cur, pose ring);
+			   // hold fallback still uses the A0 guard meaning
 	int eff_delay;      // cur - used frame index; differs on a fallback
 	double age_ms;      // how far back in TIME the used record sits
 	uint32_t presents;  // >1 would mean the scene texture was reused
@@ -1528,11 +1607,35 @@ static void stab_track_cadence(win_openvr *context, const vr::Compositor_FrameTi
 					? context->stab_rec_period + 0.05 * (per - context->stab_rec_period)
 					: per;
 	}
+	// Wall-clock gap (dashboard pause, app switch): a stale flag horizon
+	// must not survive into the resumed session's classification. Checked
+	// BEFORE stab_last_t0 updates - after it the gap always reads zero.
+	if (context->stab_last_t0 > 0.0 && t0 - context->stab_last_t0 > 1.0) {
+		context->stab_flag_recent = 0;
+		context->stab_flag_streak = 0;
+	}
 	context->stab_last_t0 = t0;
 	context->stab_last_dframe = dframe;
 	if (context->stab_dframe_avg <= 0.0)
 		context->stab_dframe_avg = 1.0;
 	context->stab_dframe_avg += 0.0165 * ((double)dframe - context->stab_dframe_avg);
+	// Flag channel for the classifier (Rift S / Oculus bridge): the driver
+	// marks motion-smoothed records per frame - per-frame TRUTH the cadence
+	// EMA can only infer with dwell lag. CORROBORATION before arming (panel):
+	// a lone flagged record is the isolated-hitch artifact class and must not
+	// buy ~300 records of wrong mode on a native rig - arm only on a second
+	// flagged record within 30. Real ASW flags continuously, so entry is
+	// delayed by exactly one record. The wall-clock gap reset lives above,
+	// before stab_last_t0 updates. Post-ASW return to native costs flag
+	// horizon + exit dwell (~300 records) by design.
+	if (cur->m_nReprojectionFlags & vr::VRCompositor_ReprojectionMotion) {
+		if (context->stab_flag_streak > 0)
+			context->stab_flag_recent = 150;
+		context->stab_flag_streak = 30;
+	} else if (context->stab_flag_recent > 0 || context->stab_flag_streak > 0) {
+		context->stab_flag_recent = std::max(0, context->stab_flag_recent - (int)std::min(dframe, 15u));
+		context->stab_flag_streak = std::max(0, context->stab_flag_streak - (int)std::min(dframe, 15u));
+	}
 }
 
 // Effective mirror lag. Auto mode classifies the pipeline from the measured
@@ -1563,10 +1666,43 @@ static double stab_effective_lag_s(win_openvr *context)
 		// Integer vsyncs-per-record with a +/-0.65 dead band around the
 		// held value (subsumes the earlier 1.6x/1.4x hysteresis).
 		const double r = D / V;
+		// Mixed-cadence detector. HARD LESSON (runs 61/62, 2026-07-26): a
+		// mixed span ratio degrades the IMAGE even when the classifier
+		// never flips - spans alternating 1V/2V under one fixed k turn the
+		// constant-duration mirror lag into a per-record ALTERNATING time
+		// error (+/-1V), which pose-domain telemetry cannot see at all
+		// (the run-40 blind spot; user ground truth re-confirmed it).
+		// So warn on the CONDITION - do not require flip symptoms.
+		{
+			const double frac = r - floor(r);
+			if (r > 1.2 && frac > 0.3 && frac < 0.7) {
+				if (context->stab_mixed_ticks < 600)
+					context->stab_mixed_ticks++;
+			} else if (context->stab_mixed_ticks > 0) {
+				context->stab_mixed_ticks--;
+			}
+			if (!context->stab_mixed_warned && context->stab_mixed_ticks > 300) {
+				context->stab_mixed_warned = true;
+				warn("stab: record spans are a mix of 1 and 2 vsyncs (span avg %.1f ms, "
+				     "vsync %.1f ms) - a fixed pairing offset alternates its time error "
+				     "and the image jitters even though pose telemetry looks clean. Set "
+				     "the headset to a refresh the game divides evenly (120 Hz for ~60 "
+				     "fps content), or cap/raise the game framerate to a clean fraction.",
+				     D * 1000.0, V * 1000.0);
+			}
+		}
 		int cand = context->stab_lag_n;
 		if (r > (double)context->stab_lag_n + 0.65 || r < (double)context->stab_lag_n - 0.65)
 			cand = (int)(r + 0.5);
 		cand = std::min(std::max(cand, 1), 4);
+		// Flag floor: while motion-smoothed records are recent, the pipeline
+		// IS reprojected regardless of what the cadence EMA reads - Oculus
+		// ASW flaps the record rate between full and half, parking the EMA
+		// mid-band where the dwelled classifier followed it back and forth
+		// with 25 ms pairing jumps (Rift S runs 54/55). The EMA may still
+		// RAISE n above 2 on genuine 3-4 vsync spans.
+		if (context->stab_flag_recent > 0 && cand < 2)
+			cand = 2;
 		if (cand != context->stab_lag_n) {
 			// Asymmetric dwell. Entering DEEPER reprojection flips fast
 			// (~0.5 s): the native runs show zero reproj-direction bursts,
@@ -1577,7 +1713,14 @@ static double stab_effective_lag_s(win_openvr *context)
 			// those is worse than riding them out.
 			// Dwell counts RECORDS, not warp ticks, so the wall time is
 			// rate-agnostic (ticks halve at canvas 30; records do not).
-			const int need = (cand > context->stab_lag_n) ? 30 : 150;
+			// Flag-verified entry is INSTANT - but ONLY for the transition
+			// the flag actually attests (into n=2). Deeper flips (2->3,
+			// 3->4) are EMA inference and keep their 30-record dwell, else
+			// sustained ASW would let every span excursion flip with zero
+			// dwell and pay the 150-record exit to undo (panel).
+			const int need = (cand > context->stab_lag_n)
+						 ? ((context->stab_flag_recent > 0 && cand == 2) ? 0 : 30)
+						 : 150;
 			context->stab_lag_dwell += (int)(context->stab_last_dframe ? context->stab_last_dframe : 1);
 			if (context->stab_lag_dwell >= need) {
 				info("stab: auto lag %d -> %d vsyncs/record (record %.2f ms, vsync %.2f ms)",
@@ -1585,6 +1728,24 @@ static double stab_effective_lag_s(win_openvr *context)
 				context->stab_lag_n = cand;
 				context->stab_lag_dwell = 0;
 				context->stab_time_reanchor = true;
+				// Flip history: the WANDERING-cadence trigger (run 61:
+				// 6 flips in 71 s = repeated 22 ms pairing jumps). The
+				// mixed-ticks trigger above catches the OTHER variant -
+				// a STEADY 1V/2V mix that never flips the classifier yet
+				// jitters the image via per-record alternating time
+				// error (run 62, image-domain ground truth; pose
+				// telemetry is blind to it). BOTH triggers are
+				// load-bearing - delete neither.
+				context->stab_flip_t[context->stab_flip_pos & 3] = context->stab_last_t0;
+				context->stab_flip_pos++;
+				if (!context->stab_mixed_warned && stab_cadence_trouble(context)) {
+					context->stab_mixed_warned = true;
+					warn("stab: pipeline cadence is flapping (record span %.1f ms vs "
+					     "vsync %.1f ms, repeated mode flips) - stabilization may jump. "
+					     "Set the headset to a refresh the game divides evenly "
+					     "(e.g. 120 Hz for ~60 fps content).",
+					     D * 1000.0, V * 1000.0);
+				}
 			}
 		} else {
 			context->stab_lag_dwell = 0;
@@ -1804,6 +1965,80 @@ static void stab_cap_execute(win_openvr *context, int64_t due)
 	InterlockedExchange(&context->cap_valid[slot], 1);
 }
 
+// Pose-source probe (PSVR2 groundwork). Probe 48 (superseding run 42's
+// misread): Sony's PC driver ships records whose TIMESTAMPS tick normally -
+// only m_HmdPose.bPoseIsValid is false on every record. GetLastPoses proved
+// to be the record pose shifted exactly +1 record (probe 49, Quest ground
+// truth) and drives the synthesis fallback; this probe stays to validate new
+// drivers. Snapshots all three pose surfaces at each boundary while telemetry
+// AND stabilization are on. Poller thread owns the file exclusively.
+static void stab_probe_write(win_openvr *context, int64_t qpc, const vr::Compositor_FrameTiming *t)
+{
+	if (!context->stab_telemetry || !context->stabilize) {
+		if (context->stab_probe_file) {
+			fclose(context->stab_probe_file);
+			context->stab_probe_file = nullptr;
+		}
+		return;
+	}
+	if (context->stab_probe_failed)
+		return; // do not retry fopen at boundary rate
+	if (!context->stab_probe_file) {
+		const char *appdata = getenv("APPDATA");
+		if (!appdata) {
+			context->stab_probe_failed = true;
+			return;
+		}
+		char path[512];
+		snprintf(path, sizeof(path), "%s\\obs-studio\\logs\\stab-probe.csv", appdata);
+		// Append: every re-init restarts the poller, and "w" would truncate
+		// a possibly hours-long capture from a hard-to-reproduce session.
+		context->stab_probe_file = fopen(path, "a");
+		if (!context->stab_probe_file) {
+			context->stab_probe_failed = true;
+			warn("stab: could not open pose probe file %s", path);
+			return;
+		}
+		// Big buffer + rare flushes: this runs on the 1 kHz poller thread,
+		// and blocking I/O here perturbs the very timing being measured.
+		setvbuf(context->stab_probe_file, nullptr, _IOFBF, 1 << 16);
+		info("stab: probing pose sources to %s", path);
+		fseek(context->stab_probe_file, 0, SEEK_END);
+		if (ftell(context->stab_probe_file) == 0)
+			fprintf(context->stab_probe_file,
+			"t_ms,idx,rec_time_s,rec_valid,rec_qw,rec_qx,rec_qy,rec_qz,rec_px,rec_py,rec_pz,"
+			"lp_err,lp_valid,lp_qw,lp_qx,lp_qy,lp_qz,lp_px,lp_py,lp_pz,lpg_valid,"
+			"gd_valid,gd_qw,gd_qx,gd_qy,gd_qz,gd_px,gd_py,gd_pz\n");
+		context->stab_probe_qpc0 = qpc;
+		context->stab_probe_lines = 0;
+	}
+	const double t_ms = (double)(qpc - context->stab_probe_qpc0) * 1000.0 / (double)context->stab_qpc_freq;
+	const quatd rq = quat_from_hmd34(t->m_HmdPose.mDeviceToAbsoluteTracking);
+	const vr::HmdMatrix34_t &rm = t->m_HmdPose.mDeviceToAbsoluteTracking;
+	vr::TrackedDevicePose_t lpr[1] = {}, lpg[1] = {}, gd[1] = {};
+	vr::EVRCompositorError lperr = vr::VRCompositorError_None;
+	if (vr::VRCompositor())
+		lperr = vr::VRCompositor()->GetLastPoses(lpr, 1, lpg, 1);
+	if (vr::VRSystem() && vr::VRCompositor())
+		vr::VRSystem()->GetDeviceToAbsoluteTrackingPose(vr::VRCompositor()->GetTrackingSpace(), 0.0f, gd, 1);
+	const quatd lq = quat_from_hmd34(lpr[0].mDeviceToAbsoluteTracking);
+	const vr::HmdMatrix34_t &lm = lpr[0].mDeviceToAbsoluteTracking;
+	const quatd gq = quat_from_hmd34(gd[0].mDeviceToAbsoluteTracking);
+	const vr::HmdMatrix34_t &gm = gd[0].mDeviceToAbsoluteTracking;
+	fprintf(context->stab_probe_file,
+		"%.3f,%u,%.6f,%d,%.8f,%.8f,%.8f,%.8f,%.5f,%.5f,%.5f,"
+		"%d,%d,%.8f,%.8f,%.8f,%.8f,%.5f,%.5f,%.5f,%d,"
+		"%d,%.8f,%.8f,%.8f,%.8f,%.5f,%.5f,%.5f\n",
+		t_ms, t->m_nFrameIndex, t->m_flSystemTimeInSeconds, t->m_HmdPose.bPoseIsValid ? 1 : 0,
+		rq.w, rq.x, rq.y, rq.z, rm.m[0][3], rm.m[1][3], rm.m[2][3],
+		(int)lperr, lpr[0].bPoseIsValid ? 1 : 0,
+		lq.w, lq.x, lq.y, lq.z, lm.m[0][3], lm.m[1][3], lm.m[2][3], lpg[0].bPoseIsValid ? 1 : 0,
+		gd[0].bPoseIsValid ? 1 : 0,
+		gq.w, gq.x, gq.y, gq.z, gm.m[0][3], gm.m[1][3], gm.m[2][3]);
+	if (++context->stab_probe_lines % 900 == 0)
+		fflush(context->stab_probe_file); // ~every 8 s; fclose flushes the tail
+}
+
 // Poller: watch the compositor's frame index far faster than we render, and
 // stamp QPC at every boundary. GetFrameTiming is a read out of the runtime's
 // shared memory, so this is cheap; it never touches D3D or the mirror SRV.
@@ -1846,10 +2081,42 @@ static DWORD WINAPI stab_poll_proc(LPVOID param)
 				const int slot = (int)((context->stab_poll_pos + 1) & 15);
 				context->stab_poll_idx[slot] = t.m_nFrameIndex;
 				context->stab_poll_qpc[slot] = wake.QuadPart;
+				// Pose ring: GetLastPoses here carries the pose of record
+				// m_nFrameIndex+1 (probe-proven exact). Cheap shared-mem
+				// read at boundary rate; must precede the pos publish.
+				// Lateness guard mirrors the capture scheduler: a stamp
+				// taken >3 ms into the record (or the session's first,
+				// unanchored stamp) may already see record i+2's pose -
+				// leave pok=0 and let the fetch fall back to a neighbor.
+				{
+					vr::TrackedDevicePose_t lp[1] = {};
+					context->stab_poll_pok[slot] = 0;
+					if (have && this_gap_ms <= 3.0 &&
+					    vr::VRCompositor()->GetLastPoses(lp, 1, nullptr, 0) ==
+						    vr::VRCompositorError_None &&
+					    lp[0].bPoseIsValid &&
+					    lp[0].eTrackingResult == vr::TrackingResult_Running_OK) {
+						const vr::HmdMatrix34_t &m = lp[0].mDeviceToAbsoluteTracking;
+						context->stab_poll_pq[slot] =
+							quat_normalize(quat_from_hmd34(m));
+						context->stab_poll_pp[slot] = {m.m[0][3], m.m[1][3],
+									       m.m[2][3]};
+						// Interlocked: MSVC may not hoist this above
+						// the payload stores (plain store could).
+						InterlockedExchange(&context->stab_poll_pok[slot], 1);
+					}
+				}
 				// publish last: readers key off pos
 				InterlockedExchange(&context->stab_poll_pos, slot);
 				last = t.m_nFrameIndex;
 				have = true;
+				stab_probe_write(context, wake.QuadPart, &t);
+				// A pending due from the PREVIOUS record must die here
+				// unconditionally: firing it after this boundary would
+				// build a slot whose cap_idx, cap_qpc and pixels describe
+				// three different records - and the deterministic selector
+				// now trusts cap_idx (panel, detpair review).
+				context->stab_cap_due = 0;
 				// Schedule this record's mid-slot capture. A wake that was
 				// itself late (>3 ms gap) detected this boundary late too -
 				// its stamp is already suspect, so sit this record out
@@ -1889,10 +2156,24 @@ static void stab_poll_start(win_openvr *context)
 	// and stale stamps from the dead session would otherwise win QPC lookups.
 	memset((void *)context->stab_poll_idx, 0, sizeof(context->stab_poll_idx));
 	memset((void *)context->stab_poll_qpc, 0, sizeof(context->stab_poll_qpc));
+	memset((void *)context->stab_poll_pq, 0, sizeof(context->stab_poll_pq));
+	memset((void *)context->stab_poll_pp, 0, sizeof(context->stab_poll_pp));
+	memset((void *)context->stab_poll_pok, 0, sizeof(context->stab_poll_pok));
+	context->stab_synth_logged = false; // re-log per session, like the ring reset
+	context->stab_synth_t0_warned = false;
+	context->stab_probe_failed = false;
 	InterlockedExchange(&context->stab_poll_run, 1);
 	context->stab_poll_thread = CreateThread(nullptr, 0, stab_poll_proc, context, 0, nullptr);
-	if (!context->stab_poll_thread)
+	if (!context->stab_poll_thread) {
 		warn("stab: could not start the frame-boundary poller; phase will be unavailable");
+	} else {
+		// TIME_CRITICAL: this is a 1 kHz timing thread that sleeps 999 of
+		// every 1000 microseconds - starving it is expensive (run 58:
+		// encoder workers at Recording Start pushed capture misses from
+		// ~2/s to 15/s = 19% repeated frames, read as judder), and its
+		// work per wake is microseconds, so it cannot starve anyone else.
+		SetThreadPriority(context->stab_poll_thread, THREAD_PRIORITY_TIME_CRITICAL);
+	}
 }
 
 static void stab_poll_stop(win_openvr *context)
@@ -1907,6 +2188,11 @@ static void stab_poll_stop(win_openvr *context)
 	WaitForSingleObject(context->stab_poll_thread, INFINITE);
 	CloseHandle(context->stab_poll_thread);
 	context->stab_poll_thread = nullptr;
+	// Safe only after the join: the poller thread owned this file.
+	if (context->stab_probe_file) {
+		fclose(context->stab_probe_file);
+		context->stab_probe_file = nullptr;
+	}
 }
 
 // Seconds since the record with this frame index began, measured. Returns <0 if
@@ -2025,21 +2311,29 @@ static void stab_hold_capture(win_openvr *context, ID3D11DeviceContext *ctx,
 }
 
 // Fetch the raw pose + reprojection flag matching the current mirror frame.
-static bool stab_fetch_pose(const vr::Compositor_FrameTiming *cur, int pose_delay, quatd *q_out, vec3d *p_out,
-			    double *t_out, bool *frozen_out, StabPairInfo *info_out)
+static bool stab_fetch_pose(win_openvr *context, const vr::Compositor_FrameTiming *cur, int pose_delay,
+			    quatd *q_out, vec3d *p_out, double *t_out, bool *frozen_out, StabPairInfo *info_out)
 {
 	// The newest timing entry is the frame the compositor just started; the
 	// mirror shows an older, already-composited frame. Track WHICH record we
-	// settled on - on a failed fetch or invalid pose we fall back to cur, which
-	// silently collapses the offset to zero.
+	// settled on - on a failed FETCH we fall back to cur, which silently
+	// collapses the offset to zero. An invalid EMBEDDED pose no longer
+	// rejects the record: PSVR2-class drivers ship EVERY record with
+	// bPoseIsValid=false while the timestamps tick normally (probe 48), so
+	// the pose is synthesized from the poller's GetLastPoses ring instead.
 	const vr::Compositor_FrameTiming *used = cur;
 	vr::Compositor_FrameTiming past = {};
 	if (pose_delay > 0) {
 		past.m_nSize = sizeof(vr::Compositor_FrameTiming);
-		if (vr::VRCompositor()->GetFrameTiming(&past, (uint32_t)pose_delay) &&
-		    past.m_HmdPose.bPoseIsValid)
+		if (vr::VRCompositor()->GetFrameTiming(&past, (uint32_t)pose_delay))
 			used = &past;
 	}
+	// pose_delay == -1: the deterministic selector wants the record ONE AHEAD
+	// of cur - it has no timing record yet on this tick phase, but the pose
+	// ring already holds its pose (slot i carries the pose of record i+1) and
+	// its timestamp is one nominal record period past cur's. Only the warp's
+	// capture path requests this; the Tier-1 resolver never returns negatives.
+	const bool ahead = pose_delay < 0;
 	const vr::TrackedDevicePose_t *pose = &used->m_HmdPose;
 
 	if (info_out) {
@@ -2060,13 +2354,87 @@ static bool stab_fetch_pose(const vr::Compositor_FrameTiming *cur, int pose_dela
 		info_out->transfer_ms = used->m_flTransferLatencyMs;
 	}
 
-	if (!pose->bPoseIsValid || pose->eTrackingResult != vr::TrackingResult_Running_OK)
-		return false;
-
-	*q_out = quat_normalize(quat_from_hmd34(pose->mDeviceToAbsoluteTracking));
-	const vr::HmdMatrix34_t &hm = pose->mDeviceToAbsoluteTracking;
-	*p_out = {hm.m[0][3], hm.m[1][3], hm.m[2][3]};
+	if (!ahead && pose->bPoseIsValid && pose->eTrackingResult == vr::TrackingResult_Running_OK) {
+		*q_out = quat_normalize(quat_from_hmd34(pose->mDeviceToAbsoluteTracking));
+		const vr::HmdMatrix34_t &hm = pose->mDeviceToAbsoluteTracking;
+		*p_out = {hm.m[0][3], hm.m[1][3], hm.m[2][3]};
+	} else {
+		// Pose synthesis: the ring slot stamped with index i holds the
+		// GetLastPoses pose of record i+1 (probe 49: exact, p50 residual
+		// 0.0000 deg), so record k's pose lives at idx == k-1. A skipped
+		// boundary (late poller wake) leaves k-1 unstamped: accept k-2's
+		// slot then - one record (~8.3 ms) stale beats an unwarped pop.
+		// Seqlock-lite: load the payload FIRST, then re-verify idx+pok -
+		// the writer recycles the oldest slot underneath scanners, and a
+		// fully rewritten quat is unit-norm so a norm check alone cannot
+		// catch it.
+		const uint32_t wantidx = used->m_nFrameIndex - (ahead ? 0u : 1u);
+		bool synth_ok = false;
+		quatd q = {1.0, 0.0, 0.0, 0.0};
+		vec3d p = {0.0, 0.0, 0.0};
+		// Ahead mode gets NO neighbor fallback: slot cur-1 holds pose(cur),
+		// the exact one-record-early substitute the contract forbids - an
+		// ahead miss must fall through to the caller's hold-last path
+		// (panel, detpair review: back=1 in ahead mode was the alternation
+		// class reintroduced).
+		for (int back = 0; back < (ahead ? 1 : 2) && !synth_ok; back++) {
+			const uint32_t idx = wantidx - (uint32_t)back;
+			for (int i = 0; i < 16; i++) {
+				if (context->stab_poll_idx[i] != idx ||
+				    !InterlockedCompareExchange(&context->stab_poll_pok[i], 1, 1))
+					continue;
+				q = context->stab_poll_pq[i];
+				p = context->stab_poll_pp[i];
+				const double n2 = quat_dot(q, q);
+				if (context->stab_poll_idx[i] == idx &&
+				    InterlockedCompareExchange(&context->stab_poll_pok[i], 1, 1) &&
+				    n2 > 0.998 && n2 < 1.002)
+					synth_ok = true;
+				break;
+			}
+		}
+		if (!synth_ok) {
+			// Quest-class blip (embedded poses normally valid): restore
+			// the pre-synthesis behavior - collapse to cur's valid pose
+			// rather than popping the correction. On PSVR2 cur's pose is
+			// invalid too, so this never masks a real ring miss there.
+			// NOT for ahead-requests: substituting cur's pose there is a
+			// one-record-early mispair that alternates with tick phase -
+			// the caller's hold-last-correction path is the consistent
+			// answer for those (~1 ms poller-stamp race frames).
+			if (!ahead && cur->m_HmdPose.bPoseIsValid &&
+			    cur->m_HmdPose.eTrackingResult == vr::TrackingResult_Running_OK) {
+				const vr::HmdMatrix34_t &cm = cur->m_HmdPose.mDeviceToAbsoluteTracking;
+				*q_out = quat_normalize(quat_from_hmd34(cm));
+				*p_out = {cm.m[0][3], cm.m[1][3], cm.m[2][3]};
+				*t_out = cur->m_flSystemTimeInSeconds;
+				*frozen_out = (cur->m_nReprojectionFlags &
+					       vr::VRCompositor_ReprojectionMotion) != 0;
+				return true;
+			}
+			return false;
+		}
+		if (!context->stab_synth_logged) {
+			context->stab_synth_logged = true;
+			info("stab: record pose invalid - synthesizing from GetLastPoses (PSVR2-class driver)");
+		}
+		if (used->m_flSystemTimeInSeconds <= 0.0 && !context->stab_synth_t0_warned) {
+			context->stab_synth_t0_warned = true;
+			warn("stab: synthesized record carries no timestamp - pairing cannot anchor "
+			     "(this driver ships neither pose nor time in its records)");
+		}
+		*q_out = q;
+		*p_out = p;
+	}
 	*t_out = used->m_flSystemTimeInSeconds;
+	if (ahead) {
+		// Quantized grid, NOT the period EMA: under load the EMA sits
+		// 1.5-3.5 ms above modal spacing (rule 1 at the lag classifier)
+		// and would jitter dt on exactly the phase-dependent subset of
+		// frames that gets ahead-served.
+		const double Vs = context->stab_vsync_s > 0.0 ? context->stab_vsync_s : 1.0 / 120.0;
+		*t_out += (double)std::max(context->stab_lag_n, 1) * Vs;
+	}
 	*frozen_out = (used->m_nReprojectionFlags & vr::VRCompositor_ReprojectionMotion) != 0;
 	return true;
 }
@@ -2243,8 +2611,10 @@ static bool stab_update_filter(win_openvr *context, const vr::Compositor_FrameTi
 	vec3d p;
 	double t;
 	bool frozen;
-	if (!stab_fetch_pose(cur, pose_delay, &q, &p, &t, &frozen, nullptr)) {
-		context->stab_has_state = false;
+	if (!stab_fetch_pose(context, cur, pose_delay, &q, &p, &t, &frozen, nullptr)) {
+		// Keep the filter state: the last crop simply persists this frame.
+		// Clearing state here forced a reseed - a visible crop jump - on
+		// every transient miss (panel, PSVR2 synthesis review).
 		return false;
 	}
 	*q_a_out = q;
@@ -2371,8 +2741,12 @@ static void stab_compute_crop(win_openvr *context, const vr::Compositor_FrameTim
 // live in head space on the union canvas.
 static bool stab_corners_ok_wide(win_openvr *context, const quatd &q_err_head, const vec3d &posc_head)
 {
-	const quatd qA = quat_normalize(quat_mul(quat_conj(context->q_e2h), q_err_head));
-	const quatd qB = quat_normalize(quat_mul(quat_conj(context->q_e2h2), q_err_head));
+	// Mirror the shader exactly: tilt composed on the ray side of each eye's
+	// rotation, Panini applied to the canvas sample points below.
+	const double tilt_r = context->stab_tilt_deg * 0.008726646259971648;
+	const quatd q_tilt = {cos(tilt_r), sin(tilt_r), 0.0, 0.0};
+	const quatd qA = quat_normalize(quat_mul(quat_mul(quat_conj(context->q_e2h), q_err_head), q_tilt));
+	const quatd qB = quat_normalize(quat_mul(quat_mul(quat_conj(context->q_e2h2), q_err_head), q_tilt));
 	const vec3d pA = quat_rotate(quat_conj(context->q_e2h), posc_head);
 	const vec3d pB = quat_rotate(quat_conj(context->q_e2h2), posc_head);
 	const double W = (double)context->device_width, H = (double)context->device_height;
@@ -2411,17 +2785,27 @@ static bool stab_corners_ok_wide(win_openvr *context, const quatd &q_err_head, c
 		}
 		const double tx = lC + u * (rC - lC);
 		const double ty = bC - v * (bC - tC);
-		const vec3d ray = {tx, ty, -1.0};
+		vec3d ray;
+		double pscale = 1.0; // posc scales with the ray's z-magnitude (shader parity)
+		if (context->stab_panini > 1e-4) {
+			const double pd = context->stab_panini;
+			const double P = tx / (pd + 1.0), P2 = P * P;
+			const double cphi = (-P2 * pd + sqrt(P2 * (1.0 - pd * pd) + 1.0)) / (P2 + 1.0);
+			ray = {P * (pd + cphi), ty * (pd + cphi) / (pd + 1.0), -cphi};
+			pscale = cphi;
+		} else {
+			ray = {tx, ty, -1.0};
+		}
 		bool ok = false;
 		const vec3d dra = quat_rotate(qA, ray);
-		const vec3d da = {dra.x - pA.x, dra.y - pA.y, dra.z - pA.z};
+		const vec3d da = {dra.x - pA.x * pscale, dra.y - pA.y * pscale, dra.z - pA.z * pscale};
 		if (da.z < -0.1) {
 			const double px = da.x / -da.z, py = da.y / -da.z;
 			ok = px >= lA + iuA && px <= rA - iuA && py >= tA + ivA && py <= bA - ivA;
 		}
 		if (!ok) {
 			const vec3d drb = quat_rotate(qB, ray);
-			const vec3d db = {drb.x - pB.x, drb.y - pB.y, drb.z - pB.z};
+			const vec3d db = {drb.x - pB.x * pscale, drb.y - pB.y * pscale, drb.z - pB.z * pscale};
 			if (db.z < -0.1) {
 				const double px = db.x / -db.z, py = db.y / -db.z;
 				ok = px >= lB + iuB && px <= rB - iuB && py >= tB + ivB && py <= bB - ivB;
@@ -2446,7 +2830,13 @@ static bool stab_corners_feasible(win_openvr *context, const quatd &q_err_head, 
 // ~2 texel safety inset).
 static bool stab_corners_ok(win_openvr *context, const quatd &q_err_head, const vec3d &posc_eye)
 {
-	const quatd q_e = quat_mul(quat_mul(quat_conj(context->q_e2h), q_err_head), context->q_e2h);
+	// MUST mirror the shader's ray construction exactly - tilt composed on
+	// the ray side, Panini applied to the sample points - or the clamp lies
+	// about the margin those framing controls consume.
+	const quatd q_e0 = quat_mul(quat_mul(quat_conj(context->q_e2h), q_err_head), context->q_e2h);
+	const double tilt_r = context->stab_tilt_deg * 0.008726646259971648;
+	const quatd q_tilt = {cos(tilt_r), sin(tilt_r), 0.0, 0.0};
+	const quatd q_e = quat_mul(q_e0, q_tilt);
 	const double W = (double)context->device_width, H = (double)context->device_height;
 	const double l = (double)context->proj_left, r = (double)context->proj_right;
 	const double t = (double)context->proj_top, b = (double)context->proj_bottom;
@@ -2454,18 +2844,50 @@ static bool stab_corners_ok(win_openvr *context, const quatd &q_err_head, const 
 	const double iv = 2.0 * (b - t) / H;
 	const double us[2] = {(double)context->x / W, (double)(context->x + context->width) / W};
 	const double vs[2] = {(double)context->y / H, (double)(context->y + context->height) / H};
-	for (int i = 0; i < 2; i++) {
+	const double pd = context->stab_panini;
+	double pts[6][2];
+	int npts = 0;
+	for (int i = 0; i < 2; i++)
 		for (int j = 0; j < 2; j++) {
-			const double tx = l + us[i] * (r - l);
-			const double ty = b - vs[j] * (b - t);
-			const vec3d dr = quat_rotate(q_e, vec3d{tx, ty, -1.0});
-			const vec3d d = {dr.x - posc_eye.x, dr.y - posc_eye.y, dr.z - posc_eye.z};
-			if (!(d.z < -0.1))
-				return false;
-			const double px = d.x / -d.z, py = d.y / -d.z;
-			if (!(px >= l + iu && px <= r - iu && py >= t + iv && py <= b - iv))
-				return false;
+			pts[npts][0] = l + us[i] * (r - l);
+			pts[npts][1] = b - vs[j] * (b - t);
+			npts++;
 		}
+	if (pd > 1e-4) {
+		// Extra top/bottom-edge samples at tx nearest 0: they guard the
+		// NEAR-PLANE/HEMISPHERE test (d.z >= -0.1), whose extreme moves to
+		// tx=0 under tilt once ty*tan(tilt) > d+1 - both corners can pass
+		// while the edge center points backwards (panel, verified). The
+		// vertical FRUSTUM extreme (py) stays at the corners.
+		const double txmin = std::min(pts[0][0], pts[2][0]);
+		const double txmax = std::max(pts[0][0], pts[2][0]);
+		const double txc = std::min(std::max(0.0, txmin), txmax);
+		pts[4][0] = txc;
+		pts[4][1] = b - vs[0] * (b - t);
+		pts[5][0] = txc;
+		pts[5][1] = b - vs[1] * (b - t);
+		npts = 6;
+	}
+	for (int n = 0; n < npts; n++) {
+		const double tx = pts[n][0], ty = pts[n][1];
+		vec3d rayv;
+		double pscale = 1.0; // posc scales with the ray's z-magnitude (shader parity)
+		if (pd > 1e-4) {
+			const double P = tx / (pd + 1.0), P2 = P * P;
+			const double cphi = (-P2 * pd + sqrt(P2 * (1.0 - pd * pd) + 1.0)) / (P2 + 1.0);
+			rayv = {P * (pd + cphi), ty * (pd + cphi) / (pd + 1.0), -cphi};
+			pscale = cphi;
+		} else {
+			rayv = {tx, ty, -1.0};
+		}
+		const vec3d dr = quat_rotate(q_e, rayv);
+		const vec3d d = {dr.x - posc_eye.x * pscale, dr.y - posc_eye.y * pscale,
+				 dr.z - posc_eye.z * pscale};
+		if (!(d.z < -0.1))
+			return false;
+		const double px = d.x / -d.z, py = d.y / -d.z;
+		if (!(px >= l + iu && px <= r - iu && py >= t + iv && py <= b - iv))
+			return false;
 	}
 	return true;
 }
@@ -2503,7 +2925,7 @@ static void stab_telemetry_write(win_openvr *context, const vr::Compositor_Frame
 			"presents,dropped,mispres,flags,"
 			"predicted,vs_ready,vs_view,crender_start_ms,crender_gpu_ms,crender_cpu_ms,"
 			"newframe_ready_ms,transfer_ms,frozen,clamped,qa_w,qa_x,qa_y,qa_z,qs_w,qs_x,qs_y,qs_z,"
-			"pa_x,pa_y,pa_z,ps_x,ps_y,ps_z,corr_deg,posc_x,posc_y,posc_z\n");
+			"pa_x,pa_y,pa_z,ps_x,ps_y,ps_z,corr_deg,posc_x,posc_y,posc_z,knee_u,lim_deg\n");
 		context->stab_telemetry_lines = 0;
 	}
 	const quatd &qa = context->stab_q_ref;
@@ -2511,7 +2933,7 @@ static void stab_telemetry_write(win_openvr *context, const vr::Compositor_Frame
 	fprintf(context->stab_telemetry_file,
 		"%.6f,%u,%d,%u,%.4f,%.4f,%.4f,%d,%d,%.4f,%d,%d,%.4f,%llu,%d,%d,%.4f,%u,%u,%u,0x%X,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,"
 		"%d,%d,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,"
-		"%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.4f,%.6f,%.6f,%.6f\n",
+		"%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.4f,%.6f,%.6f,%.6f,%.4f,%.4f\n",
 		context->prev_pose_time, cur->m_nFrameIndex, pose_delay, pr.dframe, pr.phase_ms, pr.extrap_ms,
 		pr.eff_lag_ms, pr.lag_mode, pr.cap_used, pr.cap_phase_ms, pr.pair_future, pr.vsync_ok,
 		pr.vsync_phase_ms, (unsigned long long)pr.vsync_counter,
@@ -2521,7 +2943,7 @@ static void stab_telemetry_write(win_openvr *context, const vr::Compositor_Frame
 		frozen ? 1 : 0, clamped ? 1 : 0, qa.w, qa.x,
 		qa.y, qa.z, qs.w, qs.x, qs.y, qs.z, context->stab_p_raw.x, context->stab_p_raw.y, context->stab_p_raw.z,
 		context->p_smooth.x, context->p_smooth.y, context->p_smooth.z, corr_deg, posc_eye.x, posc_eye.y,
-		posc_eye.z);
+		posc_eye.z, context->stab_knee_u, context->stab_lim_deg);
 	if (++context->stab_telemetry_lines % 90 == 0)
 		fflush(context->stab_telemetry_file);
 }
@@ -2587,35 +3009,35 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 		stab_track_cadence(context, cur);
 		const double eff_lag = stab_effective_lag_s(context);
 		int want;
+		bool want_ok = true;
 		if (use_cap) {
-			// Pairing bound by the slot's own capture stamp. On a failed
-			// ring lookup, REUSE the last pairing - never switch to a
-			// different selector mid-session: a consistent repeat glides
-			// through the reanchor, an alternating rule-change is shake.
-			const int64_t target = context->cap_qpc[cap_slot] +
-					       (int64_t)(eff_lag * (double)context->stab_qpc_freq);
-			uint32_t idx = stab_record_at_qpc(context, target);
-			// Future-target guard (panel A0, HIGH): with positive lag the
-			// target can sit past the newest ring stamp while its deciding
-			// boundary has ALREADY happened - the render gate saw the new
-			// index up to ~1 ms before the poller stamped it. The ring then
-			// returns the previous record: found-but-WRONG, alternating with
-			// tick phase. In that window the render thread's own
-			// GetFrameTiming(0) is fresher than the ring: the newest record
-			// IS cur.
-			{
-				const int rpos = (int)context->stab_poll_pos;
-				if (target > context->stab_poll_qpc[rpos] &&
-				    (int32_t)(cur->m_nFrameIndex - context->stab_poll_idx[rpos]) > 0) {
-					idx = cur->m_nFrameIndex;
-					pair.pair_future = 1;
-				}
-			}
-			want = idx ? (int)(cur->m_nFrameIndex - idx)
-				   : (context->stab_has_sel ? (int)(cur->m_nFrameIndex - context->stab_last_sel)
-							    : context->stab_pair_frames);
-			want = std::min(std::max(want, 0), 4);
-			context->stab_extrap_s = 0.0; // never predict from a capture
+			// DETERMINISTIC pairing (v3): the slot knows its own record
+			// index, so selection is pure arithmetic - the record whose
+			// span contains (capture instant + lag) on the nominal grid.
+			// No QPC ring search and no future-target race: the old
+			// target-vs-newest-stamp comparison was decided by tick phase
+			// and alternated at every non-phase-locked canvas/refresh
+			// ratio (runs 40/45; 80/60 and 90/60 field reports). floor()
+			// makes every lag within one record span select identically,
+			// so the exact-boundary knife edges (8.33, run 45) are gone by
+			// construction. k = +1 selects a record that may not exist yet
+			// at render time on some tick phases; stab_fetch_pose serves
+			// its pose from the pose ring (slot i holds pose i+1), stamped
+			// before this frame's capture completed.
+			const double Vs = context->stab_vsync_s > 0.0 ? context->stab_vsync_s : 1.0 / 120.0;
+			const double nV = (double)std::max(context->stab_lag_n, 1) * Vs;
+			int k = (int)floor((0.5 * Vs + eff_lag) / nV);
+			k = std::min(std::max(k, -4), 1); // the ring serves at most one record ahead
+			const uint32_t sel_det = context->cap_idx[cap_slot] + (uint32_t)(int32_t)k;
+			const int want_raw = (int)(int32_t)(cur->m_nFrameIndex - sel_det);
+			// want_raw < -1: the render thread stalled across a boundary and
+			// its cur snapshot is stale - no pose exists even in the ring.
+			// Treat as a fetch miss (hold-last answers) instead of silently
+			// pairing one record early through the clamp (panel).
+			want_ok = want_raw >= -1;
+			want = std::min(std::max(want_raw, -1), 4); // -1 = one ahead of cur, ring-served
+			pair.pair_future = want < 0 ? 1 : 0;    // repurposed: ahead-serve rate
+			context->stab_extrap_s = 0.0;           // never predict from a capture
 		} else if (use_hold) {
 			// Retrospective pairing: which record was newest when the GPU
 			// actually sampled the pixels we are about to warp? That instant
@@ -2646,7 +3068,7 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 		context->stab_last_sel = sel;
 		context->stab_has_sel = true;
 
-		bool have = stab_fetch_pose(cur, want, &q_a, &p_a, &t_a, &frozen, &pair);
+		bool have = want_ok && stab_fetch_pose(context, cur, want, &q_a, &p_a, &t_a, &frozen, &pair);
 
 		// Compositor drops emit adjacent records with equal or slightly
 		// REGRESSED timestamps (measured: 0 to -45 us, always dropped=1). The
@@ -2697,9 +3119,18 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 		pair.vsync_counter = vsync_frame;
 		const double ph = stab_phase_of(context, cur->m_nFrameIndex);
 		pair.phase_ms = ph >= 0.0 ? ph * 1000.0 : -1.0;
-		if (!have)
-			context->stab_has_state = false;
-		else if (stab_filter_core(context, cur, q_a, p_a, t_a)) {
+		if (!have) {
+			// Fetch/ring miss: hold LAST frame's correction instead of
+			// popping to unwarped (the cardinal invariant), and reanchor
+			// so the next success glides. Filter state is kept - a
+			// one-frame hold is the codebase's own "consistent repeat"
+			// rule. Only a cold start renders uncorrected.
+			if (context->stab_has_state) {
+				q_err = context->q_err_last;
+				posc_h = context->stab_posc_last;
+				context->stab_time_reanchor = true;
+			}
+		} else if (stab_filter_core(context, cur, q_a, p_a, t_a)) {
 			q_a_eff = q_a;
 			q_err = quat_mul(quat_conj(q_a), context->q_smooth);
 			posc_h = context->stab_posc;
@@ -2711,6 +3142,13 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 	// the pose the displayed frame was rendered with; the rotational excess
 	// folds back into q_smooth so the correction rides the largest feasible
 	// fraction (the positional state is self-bounded at 2 cm).
+	// NOTE: a soft-knee + rate-limited-fold variant shipped briefly and was
+	// REVERTED on user verdict (2026-07-25, runs 44-46): any pre-ceiling give
+	// reads as lost smoothness on this use-case. Do not re-add softening
+	// without new evidence. knee_u/lim_deg telemetry columns remain for CSV
+	// format stability and always log 0.
+	context->stab_knee_u = 0.0;
+	context->stab_lim_deg = 0.0;
 	if (corrected && !context->stab_black_edges && !stab_corners_feasible(context, q_err, posc_h)) {
 		const quatd q_target = context->q_smooth;
 		const vec3d posc_full = posc_h;
@@ -2738,6 +3176,16 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 	// space, so the correction is conjugated into it (conj(e)*q*e). Wide
 	// mode: canvas rays live in HEAD space, so each eye's matrix carries
 	// the head->eye rotation itself (conj(e)*q).
+	// Framing tilt: a constant pitch of the OUTPUT camera, composed on the
+	// canvas-ray side (right-multiplied) so it rides the stabilized view -
+	// unlike the pixel offsets, this reprojects. Positive tilts the view up.
+	// Gated on stabilize: in wide-without-stab the warp still runs but the
+	// clamp does not, the sliders are hidden, and the tooltips say "requires
+	// Stabilization" - an invisible active control with no feasibility
+	// protection is a user trap (panel). Matches single-eye-no-stab.
+	const double tilt_r =
+		(context->stabilize ? context->stab_tilt_deg : 0.0) * 0.008726646259971648; // deg/2 in rad
+	const quatd q_tilt = {cos(tilt_r), sin(tilt_r), 0.0, 0.0};
 	const quatd qA = context->wide_active
 				 ? quat_mul(quat_conj(context->q_e2h), q_err)
 				 : quat_mul(quat_mul(quat_conj(context->q_e2h), q_err), context->q_e2h);
@@ -2763,7 +3211,8 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 	cb.poscA[0] = (float)pA.x;
 	cb.poscA[1] = (float)pA.y;
 	cb.poscA[2] = (float)pA.z;
-	quat_to_mat4(quat_normalize(qA), cb.RdA);
+	cb.poscA[3] = context->stabilize ? (float)context->stab_panini : 0.0f;
+	quat_to_mat4(quat_normalize(quat_mul(qA, q_tilt)), cb.RdA);
 	if (context->wide_active) {
 		const quatd qB = quat_mul(quat_conj(context->q_e2h2), q_err);
 		const vec3d pB = quat_rotate(quat_conj(context->q_e2h2), posc_h);
@@ -2774,7 +3223,7 @@ static bool stab_render_warp(win_openvr *context, const vr::Compositor_FrameTimi
 		cb.poscB[0] = (float)pB.x;
 		cb.poscB[1] = (float)pB.y;
 		cb.poscB[2] = (float)pB.z;
-		quat_to_mat4(quat_normalize(qB), cb.RdB);
+		quat_to_mat4(quat_normalize(quat_mul(qB, q_tilt)), cb.RdB);
 	}
 
 	ID3D11DeviceContext *ctx = context->shared_context.Get();
@@ -2913,10 +3362,18 @@ static bool stab_ui_modd(obs_properties_t *props, obs_property_t *property, obs_
 	// Collapsed panel (UI v1): main = Strength + Level Horizon + the zoom
 	// warning; everything else behind Show Advanced. The investigation-era
 	// pairing controls have no UI at all - the machinery is always on, and
-	// their settings keys stay readable for scripts.
+	// their settings keys stay readable for scripts. Exception: Hold One
+	// Frame is back under Advanced as the capture-cost A/B switch.
 	const bool adv = obs_data_get_bool(settings, "stab_advanced");
 	bool changed = set_vis(props, "stab_zoom_warning", on && nomargin);
+	// The cadence warning's ON-visibility is decided at panel build (only
+	// place the runtime trouble state is known); hide it here when the user
+	// unchecks Stabilization so it cannot linger as the lone stab control.
+	if (!on)
+		changed |= set_vis(props, "stab_cadence_warning", false);
 	changed |= set_vis(props, "stab_preset", on);
+	changed |= set_vis(props, "stab_tilt_deg", on);
+	changed |= set_vis(props, "stab_panini", on);
 	changed |= set_vis(props, "stab_roll_lock", on);
 	changed |= set_vis(props, "stab_advanced", on);
 	changed |= set_vis(props, "stab_filter", on && adv);
@@ -2925,6 +3382,7 @@ static bool stab_ui_modd(obs_properties_t *props, obs_property_t *property, obs_
 	changed |= set_vis(props, "stab_pos_depth", on && adv && pos);
 	changed |= set_vis(props, "stab_lag_base_ms", on && adv);
 	changed |= set_vis(props, "stab_full_lock", on && adv);
+	changed |= set_vis(props, "stab_hold", on && adv);
 	changed |= set_vis(props, "stab_debug", on && adv);
 	changed |= set_vis(props, "stab_telemetry", on && adv);
 
@@ -2942,6 +3400,25 @@ static bool stab_ui_modd(obs_properties_t *props, obs_property_t *property, obs_
 		}
 	}
 	return changed;
+}
+
+// Runtime cadence-trouble predicate: sustained mixed spans OR 3+ classifier
+// flips inside a minute. BOTH matter - flips jump the pairing 2V at a time
+// (run 61), while a steady 1V/2V mix alternates the pairing time error with
+// ZERO flips and pristine pose telemetry (run 62, image-domain ground truth
+// from the user). Read on the UI thread from plain ints - stale-by-a-tick is
+// fine for a warning row.
+static bool stab_cadence_trouble(win_openvr *context)
+{
+	if (context->stab_mixed_ticks > 300)
+		return true;
+	if (context->stab_flip_pos < 3)
+		return false;
+	const double newest = context->stab_flip_t[(context->stab_flip_pos - 1) & 3];
+	const double third = context->stab_flip_t[(context->stab_flip_pos - 3) & 3];
+	// Recency: three flips from an old load stutter must not pin the warning
+	// for the rest of the session (panel).
+	return newest > 0.0 && newest - third < 60.0 && context->stab_last_t0 - newest < 60.0;
 }
 
 static bool ar_modd(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
@@ -2997,6 +3474,18 @@ static obs_properties_t *win_openvr_properties(void *data)
 	obs_property_set_modified_callback(p, stab_ui_modd);
 	p = obs_properties_add_int(props, "x_offset", obs_module_text("Horizontal Offset"), -10000, 10000, 1);
 	p = obs_properties_add_int(props, "y_offset", obs_module_text("Vertical Offset"), -10000, 10000, 1);
+	p = obs_properties_add_float_slider(props, "stab_tilt_deg", obs_module_text("Camera Tilt (deg)"), -45.0, 45.0,
+					    0.1);
+	obs_property_set_long_description(
+		p, obs_module_text("Pitches the projected view up (+) or down (-) relative to the STABILIZED "
+				   "view - a true reprojection, unlike the pixel offsets. Consumes crop "
+				   "margin like corrections do. Requires Stabilization (shader path)."));
+	p = obs_properties_add_float_slider(props, "stab_panini", obs_module_text("Panini Projection"), 0.0, 1.0, 0.01);
+	obs_property_set_long_description(
+		p, obs_module_text("0 = normal perspective. Higher values widen the view and compress the "
+				   "horizontal periphery with straight verticals - the action-cam look. "
+				   "Widens the field of view: combine with Zoom to frame. Requires "
+				   "Stabilization (shader path)."));
 
 	// Stabilization
 	p = obs_properties_add_bool(props, "stabilize", obs_module_text("Stabilization (Experimental)"));
@@ -3009,6 +3498,18 @@ static obs_properties_t *win_openvr_properties(void *data)
 						    "Increase Zoom (1.2+) to hide them."),
 				    OBS_TEXT_INFO);
 	obs_property_text_set_info_type(p, OBS_TEXT_INFO_WARNING);
+	// Runtime warning: visibility decided from measured state when the panel
+	// opens (properties cannot refresh themselves while idle - the OBS log
+	// carries the same warning the moment the condition first sustains).
+	p = obs_properties_add_text(
+		props, "stab_cadence_warning",
+		obs_module_text("Headset refresh and game framerate are in a mixed ratio (e.g. 90 Hz "
+				"with ~60 fps content) - stabilization cannot pair reliably and may "
+				"jump. Set the headset to a refresh the game divides evenly: 120 Hz "
+				"for ~60 fps content, or lower the refresh to match the game."),
+		OBS_TEXT_INFO);
+	obs_property_text_set_info_type(p, OBS_TEXT_INFO_WARNING);
+	obs_property_set_visible(p, false);
 	p = obs_properties_add_list(props, "stab_preset", obs_module_text("Strength"), OBS_COMBO_TYPE_LIST,
 				    OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(p, obs_module_text("Low"), 1);
@@ -3059,13 +3560,24 @@ static obs_properties_t *win_openvr_properties(void *data)
 				   "some parallax shake. 1.0-2.0 m suits close-range games; push toward 100 m "
 				   "(effectively infinite) for distant scenery / horizons - the positional "
 				   "correction shrinks with depth, so far content stops being pushed around."));
+	// 0.01 ms steps: validating the lag-equals-one-vsync model needs values
+	// like 8.33/12.50 exactly; type into the number field rather than drag.
 	p = obs_properties_add_float_slider(props, "stab_lag_base_ms", obs_module_text("Mirror Lag (ms)"), -20.0, 40.0,
-					   0.5);
+					   0.01);
 	obs_property_set_long_description(
 		p, obs_module_text("The one calibration: how long after a frame is composited its pixels reach "
 				   "the mirror on THIS rig (+8.5 here). Auto-adjusted per load and refresh - "
 				   "reprojected games derive their value from this one. To calibrate: check "
 				   "Calibration: Freeze View, shake the headset, sweep until dead still."));
+	// Restored after the UI collapse for the capture-cost A/B: OFF idles the
+	// boundary-locked capture (no per-record mirror copies) and warps the live
+	// mirror with extrapolated pairing - v2.1 behavior. Default stays ON.
+	p = obs_properties_add_bool(props, "stab_hold", obs_module_text("Hold One Frame"));
+	obs_property_set_long_description(
+		p, obs_module_text("Warp the previous frame's captured pixels so the pose is measured, not "
+				   "predicted. Leave ON - OFF reverts to live-mirror pairing with predicted "
+				   "poses, which overshoots when head motion changes direction. Uncheck only "
+				   "to test whether the capture copies cost game performance."));
 	p = obs_properties_add_bool(props, "stab_debug", obs_module_text("Stabilization: Debug Logging"));
 	p = obs_properties_add_bool(props, "stab_telemetry", obs_module_text("Stabilization: Record Telemetry (CSV)"));
 	obs_property_set_long_description(
@@ -3078,6 +3590,8 @@ static obs_properties_t *win_openvr_properties(void *data)
 		obs_data_t *settings = obs_source_get_settings(context->source);
 		ar_modd(props, NULL, settings);
 		stab_ui_modd(props, NULL, settings);
+		obs_property_set_visible(obs_properties_get(props, "stab_cadence_warning"),
+					 obs_data_get_bool(settings, "stabilize") && stab_cadence_trouble(context));
 		obs_data_release(settings);
 	}
 
